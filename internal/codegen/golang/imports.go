@@ -115,7 +115,7 @@ func (i *importer) Imports(filename string) [][]ImportSpec {
 	case batchFileName:
 		return mergeImports(i.batchImports())
 	case readQueriesFileName:
-		return mergeImports(i.dbImports())
+		return mergeImports(i.readQueriesImports())
 	default:
 		return mergeImports(i.queryImports(filename))
 	}
@@ -410,6 +410,34 @@ func (i *importer) queryImports(filename string) fileImports {
 	}
 
 	return sortedImports(std, pkg)
+}
+
+// readQueriesImports computes the imports needed by the read-only queries
+// aggregated into the read.go file (see EmitReadOnlyPrepared). Unlike the
+// per-source-file queries handled by queryImports, the ReadQueries methods
+// never redeclare Arg/Ret struct types (readQueriesFileStd has no
+// EmitStruct blocks) - those types are already declared, and their imports
+// already accounted for, in the regular per-source-file that owns them. So
+// read.go's own import needs are exactly dbImports()'s, plus "strings" if
+// any read-only query uses a sqlc.slice() param (queryCodeStdExec, shared
+// with the regular per-file query bodies, emits strings.Replace/Repeat for
+// those). Scanning Arg/Ret struct fields for stdlib types the way
+// queryImports does would incorrectly add imports read.go never uses.
+func (i *importer) readQueriesImports() fileImports {
+	imports := i.dbImports()
+
+	sqlpkg := parseDriver(i.Options.SqlPackage)
+	if !sqlpkg.IsPGX() {
+		for _, q := range readOnly(i.Queries) {
+			if q.Arg.HasSqlcSlices() {
+				imports.Std = append(imports.Std, ImportSpec{Path: "strings"})
+				break
+			}
+		}
+	}
+
+	sort.Slice(imports.Std, func(a, b int) bool { return imports.Std[a].Path < imports.Std[b].Path })
+	return imports
 }
 
 func (i *importer) copyfromImports() fileImports {
