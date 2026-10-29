@@ -439,6 +439,30 @@ func filterUnusedStructs(enums []Enum, structs []Struct, queries []Query, qualif
 	return keepEnums, keepStructs
 }
 
+// keywordFollowedBySpace reports whether kw appears in s followed by whitespace
+// (space, tab, or newline). A plain substring check on "KEYWORD " misses queries
+// formatted with a newline right after the keyword, e.g.:
+//
+//	SELECT
+//	    col1, col2
+//
+// which is a common style for wide column lists and must not be misclassified
+// as lacking a SELECT (or falsely matching UPDATE/INSERT/DELETE only when
+// followed by a space).
+func keywordFollowedBySpace(s, kw string) bool {
+	for {
+		idx := strings.Index(s, kw)
+		if idx == -1 {
+			return false
+		}
+		after := idx + len(kw)
+		if after < len(s) && (s[after] == ' ' || s[after] == '\t' || s[after] == '\n' || s[after] == '\r') {
+			return true
+		}
+		s = s[after:]
+	}
+}
+
 func readOnly(queries []Query) []Query {
 	var rq []Query
 	for _, q := range queries {
@@ -447,13 +471,13 @@ func readOnly(queries []Query) []Query {
 		}
 
 		qsql := strings.ToUpper(q.SQL)
-		if !strings.Contains(qsql, "SELECT ") {
+		if !keywordFollowedBySpace(qsql, "SELECT") {
 			continue
 		}
-		if strings.Contains(qsql, "INSERT ") ||
-			strings.Contains(qsql, "UPDATE ") ||
+		if keywordFollowedBySpace(qsql, "INSERT") ||
+			keywordFollowedBySpace(qsql, "UPDATE") ||
 			strings.Contains(qsql, "FOR UPDATE") ||
-			strings.Contains(qsql, "DELETE ") {
+			keywordFollowedBySpace(qsql, "DELETE") {
 			continue
 		}
 
