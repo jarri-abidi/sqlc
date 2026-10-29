@@ -1,0 +1,45 @@
+{
+  "dialect": "sqlite",
+  "alias": "base",
+  "const": {
+    "integer": "integer",
+    "float": "real",
+    "string": "text",
+    "bool": "boolean"
+  },
+  "bool": "boolean",
+  "comparison": ["=", "==", "<>", "!=", "<", "<=", ">", ">=", "IS", "IS NOT", "LIKE", "NOT LIKE", "GLOB", "NOT GLOB", "REGEXP", "NOT REGEXP", "MATCH", "NOT MATCH"],
+  "comparison_categories": "BNSDU",
+  "arithmetic": ["+", "-", "*", "/", "%"],
+  "arithmetic_categories": "N",
+  "cast_categories": "*",
+  "modules": {
+    "fts3": "enable_fts3",
+    "fts4": "enable_fts3",
+    "fts5": "enable_fts5",
+    "geopoly": "enable_geopoly",
+    "rtree": "enable_rtree",
+    "rtree_i32": "enable_rtree"
+  },
+  "affinity": [
+    {
+      "contains": ["INT"],
+      "type": "integer"
+    },
+    {
+      "contains": ["CHAR", "CLOB", "TEXT"],
+      "type": "text"
+    },
+    {
+      "contains": ["BLOB"],
+      "type": "blob"
+    },
+    {
+      "contains": ["REAL", "FLOA", "DOUB"],
+      "type": "real"
+    },
+    {
+      "type": "numeric"
+    }
+  ]
+}

@@ -13,7 +13,6 @@ import (
 
 	"github.com/sqlc-dev/sqlc/internal/compiler"
 	"github.com/sqlc-dev/sqlc/internal/config"
-	"github.com/sqlc-dev/sqlc/internal/debug"
 	"github.com/sqlc-dev/sqlc/internal/opts"
 )
 
@@ -88,7 +87,7 @@ func processQuerySets(ctx context.Context, rp ResultProcessor, conf *config.Conf
 
 			var name, lang string
 			parseOpts := opts.Parser{
-				Debug: debug.Debug,
+				Experiment: o.Env.Experiment,
 			}
 
 			switch {

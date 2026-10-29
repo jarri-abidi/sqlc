@@ -6,13 +6,16 @@ import (
 	"io"
 	"strings"
 
-	nodes "github.com/pganalyze/pg_query_go/v6"
+	nodes "github.com/sqlc-dev/oliphant"
+	"github.com/sqlc-dev/oliphant/parser"
 
-	"github.com/sqlc-dev/sqlc/internal/engine/postgresql/parser"
 	"github.com/sqlc-dev/sqlc/internal/source"
 	"github.com/sqlc-dev/sqlc/internal/sql/ast"
 	"github.com/sqlc-dev/sqlc/internal/sql/sqlerr"
 )
+
+var Parse = nodes.Parse
+var Fingerprint = nodes.Fingerprint
 
 func stringSlice(list *nodes.List) []string {
 	items := []string{}
@@ -147,18 +150,54 @@ type Parser struct {
 var errSkip = errors.New("skip stmt")
 
 func (p *Parser) Parse(r io.Reader) ([]ast.Statement, error) {
-	contents, err := io.ReadAll(r)
+	f, err := p.ParseFile(r)
 	if err != nil {
 		return nil, err
 	}
-	tree, err := Parse(string(contents))
+	return f.Stmts, nil
+}
+
+// ParseFile parses like Parse and also carries the file's comments, which
+// oliphant's parser collects from the same pass its scanner already makes
+// over the input.
+func (p *Parser) ParseFile(r io.Reader) (*ast.File, error) {
+	blob, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	contents := string(blob)
+	parsed, err := parser.ParseFile(contents)
 	if err != nil {
 		pErr := normalizeErr(err)
 		return nil, pErr
 	}
+	tree := parsed.ParseResult
 
 	var stmts []ast.Statement
+	// PostgreSQL 18 changed stmt_location to point at the statement's first
+	// token. The rest of the compiler expects the earlier convention, where a
+	// statement begins where the previous one ended and so carries its leading
+	// comments (that's where `-- name:` lives).
+	loc := 0
 	for _, raw := range tree.Stmts {
+		start := loc
+		end := int(raw.StmtLocation) + int(raw.StmtLen)
+		next := end
+		for next < len(contents) && contents[next] != ';' {
+			next++
+		}
+		terminated := next < len(contents)
+		if terminated {
+			next++
+		}
+		loc = next
+		length := end - start
+		if !terminated {
+			// A zero length marked an unterminated final statement before
+			// PostgreSQL 18, and the compiler still reports it that way.
+			length = 0
+		}
+
 		n, err := translate(raw.Stmt)
 		if err == errSkip {
 			continue
@@ -172,12 +211,38 @@ func (p *Parser) Parse(r io.Reader) ([]ast.Statement, error) {
 		stmts = append(stmts, ast.Statement{
 			Raw: &ast.RawStmt{
 				Stmt:         n,
-				StmtLocation: int(raw.StmtLocation),
-				StmtLen:      int(raw.StmtLen),
+				StmtLocation: start,
+				StmtLen:      length,
 			},
 		})
 	}
-	return stmts, nil
+
+	var comments []ast.Comment
+	for _, tok := range parsed.Comments {
+		comments = append(comments, ast.Comment{
+			Text:    strings.TrimRight(contents[tok.Start:tok.End], " \t\r\n"),
+			Start:   int(tok.Start),
+			End:     int(tok.End),
+			OwnLine: ownLine(contents, int(tok.Start)),
+		})
+	}
+	return &ast.File{Stmts: stmts, Comments: comments}, nil
+}
+
+// ownLine reports that only blank space sits between the preceding line
+// break and pos.
+func ownLine(src string, pos int) bool {
+	for j := pos - 1; j >= 0; j-- {
+		switch src[j] {
+		case '\n':
+			return true
+		case ' ', '\t', '\r':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeErr(err error) error {
@@ -281,7 +346,7 @@ func translate(node *nodes.Node) (ast.Node, error) {
 					item.Subtype = ast.AT_AddColumn
 					item.Def = &ast.ColumnDef{
 						Colname:   d.ColumnDef.Colname,
-						TypeName:  rel.TypeName(),
+						TypeName:  columnTypeName(rel, d.ColumnDef.TypeName),
 						IsNotNull: isNotNull(d.ColumnDef),
 						IsArray:   isArray(d.ColumnDef.TypeName),
 						ArrayDims: len(d.ColumnDef.TypeName.ArrayBounds),
@@ -307,7 +372,7 @@ func translate(node *nodes.Node) (ast.Node, error) {
 					item.Subtype = ast.AT_AlterColumnType
 					item.Def = &ast.ColumnDef{
 						Colname:   col,
-						TypeName:  rel.TypeName(),
+						TypeName:  columnTypeName(rel, d.ColumnDef.TypeName),
 						IsNotNull: isNotNull(d.ColumnDef),
 						IsArray:   isArray(d.ColumnDef.TypeName),
 						ArrayDims: len(d.ColumnDef.TypeName.ArrayBounds),
@@ -392,9 +457,27 @@ func translate(node *nodes.Node) (ast.Node, error) {
 	case *nodes.Node_CompositeTypeStmt:
 		n := inner.CompositeTypeStmt
 		rel := parseRelationFromRangeVar(n.Typevar)
-		return &ast.CompositeTypeStmt{
-			TypeName: rel.TypeName(),
-		}, nil
+		stmt := &ast.CompositeTypeStmt{
+			TypeName:   rel.TypeName(),
+			Coldeflist: &ast.List{},
+		}
+		for _, node := range n.Coldeflist {
+			field, ok := node.Node.(*nodes.Node_ColumnDef)
+			if !ok {
+				continue
+			}
+			rel, err := parseRelationFromNodes(field.ColumnDef.TypeName.Names)
+			if err != nil {
+				return nil, err
+			}
+			stmt.Coldeflist.Items = append(stmt.Coldeflist.Items, &ast.ColumnDef{
+				Colname:   field.ColumnDef.Colname,
+				TypeName:  columnTypeName(rel, field.ColumnDef.TypeName),
+				IsArray:   isArray(field.ColumnDef.TypeName),
+				ArrayDims: len(field.ColumnDef.TypeName.ArrayBounds),
+			})
+		}
+		return stmt, nil
 
 	case *nodes.Node_CreateStmt:
 		n := inner.CreateStmt
@@ -445,7 +528,7 @@ func translate(node *nodes.Node) (ast.Node, error) {
 
 				create.Cols = append(create.Cols, &ast.ColumnDef{
 					Colname:    item.ColumnDef.Colname,
-					TypeName:   rel.TypeName(),
+					TypeName:   columnTypeName(rel, item.ColumnDef.TypeName),
 					IsNotNull:  isNotNull(item.ColumnDef) || primaryKey[item.ColumnDef.Colname],
 					IsArray:    isArray(item.ColumnDef.TypeName),
 					ArrayDims:  len(item.ColumnDef.TypeName.ArrayBounds),
@@ -643,3 +726,73 @@ func translate(node *nodes.Node) (ast.Node, error) {
 		return convert(node)
 	}
 }
+
+// columnTypeName is a column's type as the catalog needs it: the name the
+// relation resolves, with the type modifiers the parser reported. Every
+// modifier is an integer constant, except that an interval's first one is a
+// bit mask of the fields it keeps, which is decoded into the words
+// format_type prints, so that "interval day to second" carries "day to
+// second" as its first argument.
+func columnTypeName(rel *relation, tn *nodes.TypeName) *ast.TypeName {
+	out := rel.TypeName()
+	if tn == nil || len(tn.Typmods) == 0 {
+		return out
+	}
+	out.Typmods = &ast.List{}
+	for i, mod := range tn.Typmods {
+		c, ok := mod.Node.(*nodes.Node_AConst)
+		if !ok {
+			continue
+		}
+		ival, ok := c.AConst.Val.(*nodes.A_Const_Ival)
+		if !ok {
+			continue
+		}
+		if i == 0 && rel.Name == "interval" {
+			fields, ok := intervalFields[ival.Ival.Ival]
+			if !ok {
+				continue
+			}
+			if fields != "" {
+				out.Typmods.Items = append(out.Typmods.Items, &ast.String{Str: fields})
+			}
+			continue
+		}
+		out.Typmods.Items = append(out.Typmods.Items, &ast.A_Const{Val: &ast.Integer{Ival: int64(ival.Ival.Ival)}})
+	}
+	if len(out.Typmods.Items) == 0 {
+		out.Typmods = nil
+	}
+	return out
+}
+
+// intervalFields decodes the field mask an interval typmod starts with —
+// INTERVAL_MASK(YEAR) | INTERVAL_MASK(MONTH) and so on, with the field
+// numbers PostgreSQL's datetime.h assigns — into the words a declaration
+// spells. The full range is written as nothing.
+var intervalFields = func() map[int32]string {
+	const (
+		month  = 1 << 1
+		year   = 1 << 2
+		day    = 1 << 3
+		hour   = 1 << 10
+		minute = 1 << 11
+		second = 1 << 12
+	)
+	return map[int32]string{
+		0x7FFF:                       "",
+		year:                         "year",
+		month:                        "month",
+		day:                          "day",
+		hour:                         "hour",
+		minute:                       "minute",
+		second:                       "second",
+		year | month:                 "year to month",
+		day | hour:                   "day to hour",
+		day | hour | minute:          "day to minute",
+		day | hour | minute | second: "day to second",
+		hour | minute:                "hour to minute",
+		hour | minute | second:       "hour to second",
+		minute | second:              "minute to second",
+	}
+}()

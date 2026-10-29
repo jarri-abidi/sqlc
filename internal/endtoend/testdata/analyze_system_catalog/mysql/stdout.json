@@ -1,0 +1,93 @@
+[
+  {
+    "name": "ListColumns",
+    "cmd": ":many",
+    "columns": [
+      {
+        "name": "table_name",
+        "type": {
+          "name": "varchar",
+          "args": [
+            {
+              "int": 64
+            }
+          ]
+        },
+        "table": "columns"
+      },
+      {
+        "name": "column_name",
+        "type": {
+          "name": "varchar",
+          "nullable": true,
+          "args": [
+            {
+              "int": 64
+            }
+          ]
+        },
+        "table": "columns"
+      },
+      {
+        "name": "data_type",
+        "type": {
+          "name": "longtext",
+          "nullable": true
+        },
+        "table": "columns"
+      }
+    ],
+    "params": [
+      {
+        "number": 1,
+        "column": {
+          "name": "table_schema",
+          "type": {
+            "name": "varchar",
+            "args": [
+              {
+                "int": 64
+              }
+            ]
+          },
+          "table": "columns"
+        }
+      }
+    ]
+  },
+  {
+    "name": "CountTables",
+    "cmd": ":one",
+    "columns": [
+      {
+        "name": "total",
+        "type": {
+          "name": "bigint"
+        }
+      }
+    ],
+    "params": [
+      {
+        "number": 1,
+        "column": {
+          "name": "table_type",
+          "type": {
+            "name": "enum",
+            "args": [
+              {
+                "string": "BASE TABLE"
+              },
+              {
+                "string": "VIEW"
+              },
+              {
+                "string": "SYSTEM VIEW"
+              }
+            ]
+          },
+          "table": "tables"
+        }
+      }
+    ]
+  }
+]

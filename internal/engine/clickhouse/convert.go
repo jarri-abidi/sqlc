@@ -1,16 +1,34 @@
 package clickhouse
 
 import (
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	chast "github.com/sqlc-dev/doubleclick/ast"
+	"github.com/sqlc-dev/doubleclick/token"
 
 	"github.com/sqlc-dev/sqlc/internal/sql/ast"
 )
 
 type cc struct {
 	paramCount int
+	// named maps the name of each {name:Type} placeholder to its number:
+	// the query binds a name once, however many times it uses it.
+	named map[string]int
+}
+
+// pos is a node's byte offset in the query. doubleclick counts positions
+// from one; the rest of sqlc counts from zero.
+func pos(n interface{ Pos() token.Position }) int {
+	if n == nil {
+		return 0
+	}
+	if off := n.Pos().Offset; off > 0 {
+		return off - 1
+	}
+	return 0
 }
 
 func (c *cc) convert(node chast.Node) ast.Node {
@@ -152,19 +170,24 @@ func (c *cc) convertSelectQuery(n *chast.SelectQuery) *ast.SelectStmt {
 			Ctes: &ast.List{},
 		}
 		for _, cte := range n.With {
-			if aliased, ok := cte.(*chast.AliasedExpr); ok {
-				cteNode := &ast.CommonTableExpr{
-					Ctename: &aliased.Alias,
-				}
-				// CTE expression may be a Subquery containing the actual SELECT
-				if subq, ok := aliased.Expr.(*chast.Subquery); ok {
-					cteNode.Ctequery = c.convert(subq.Query)
-				} else {
-					// Fallback: treat the expression itself as the query
-					cteNode.Ctequery = c.convertExpr(aliased.Expr)
-				}
-				stmt.WithClause.Ctes.Items = append(stmt.WithClause.Ctes.Items, cteNode)
+			var name string
+			var query chast.Expression
+			switch w := cte.(type) {
+			case *chast.WithElement:
+				// "name AS (SELECT ...)" or a scalar "(expr) AS name".
+				name, query = w.Name, w.Query
+			case *chast.AliasedExpr:
+				name, query = w.Alias, w.Expr
+			default:
+				continue
 			}
+			cteNode := &ast.CommonTableExpr{Ctename: &name}
+			if subq, ok := query.(*chast.Subquery); ok {
+				cteNode.Ctequery = c.convert(subq.Query)
+			} else {
+				cteNode.Ctequery = c.convertExpr(query)
+			}
+			stmt.WithClause.Ctes.Items = append(stmt.WithClause.Ctes.Items, cteNode)
 		}
 	}
 
@@ -173,7 +196,7 @@ func (c *cc) convertSelectQuery(n *chast.SelectQuery) *ast.SelectStmt {
 
 func (c *cc) convertToResTarget(expr chast.Expression) *ast.ResTarget {
 	res := &ast.ResTarget{
-		Location: expr.Pos().Offset,
+		Location: pos(expr),
 	}
 
 	switch e := expr.(type) {
@@ -196,24 +219,160 @@ func (c *cc) convertToResTarget(expr chast.Expression) *ast.ResTarget {
 				},
 			}
 		}
+		return res
 	case *chast.AliasedExpr:
 		res.Name = &e.Alias
 		res.Val = c.convertExpr(e.Expr)
+		return res
 	case *chast.Identifier:
 		if e.Alias != "" {
 			res.Name = &e.Alias
 		}
 		res.Val = c.convertIdentifier(e)
-	case *chast.FunctionCall:
-		if e.Alias != "" {
-			res.Name = &e.Alias
-		}
-		res.Val = c.convertFunctionCall(e)
-	default:
-		res.Val = c.convertExpr(expr)
+		return res
 	}
 
+	res.Val = c.convertExpr(expr)
+	if alias := exprAlias(expr); alias != "" {
+		res.Name = &alias
+	} else if name := columnName(expr); name != "" {
+		// ClickHouse names an unaliased expression column after the
+		// expression itself, written in its canonical function form.
+		res.Name = &name
+	}
 	return res
+}
+
+// exprAlias returns the alias the parser attached to an expression, for
+// the node kinds that carry one directly.
+func exprAlias(expr chast.Expression) string {
+	switch e := expr.(type) {
+	case *chast.AliasedExpr:
+		return e.Alias
+	case *chast.Identifier:
+		return e.Alias
+	case *chast.FunctionCall:
+		return e.Alias
+	case *chast.CaseExpr:
+		return e.Alias
+	case *chast.CastExpr:
+		return e.Alias
+	case *chast.LikeExpr:
+		return e.Alias
+	case *chast.ExtractExpr:
+		return e.Alias
+	case *chast.Subquery:
+		return e.Alias
+	}
+	return ""
+}
+
+// binaryFunctions are the function names ClickHouse gives its operators when
+// it names a column after an expression.
+var binaryFunctions = map[string]string{
+	"+": "plus", "-": "minus", "*": "multiply", "/": "divide", "%": "modulo",
+	"=": "equals", "==": "equals", "!=": "notEquals", "<>": "notEquals",
+	"<": "less", ">": "greater", "<=": "lessOrEquals", ">=": "greaterOrEquals",
+	"AND": "and", "OR": "or", "||": "concat",
+}
+
+// columnName writes an expression the way ClickHouse names a result column
+// that has no alias: a function call with its arguments, an operator as the
+// function it stands for, an identifier or literal as written. It returns ""
+// for an expression it cannot write, which then keeps sqlc's own name.
+func columnName(expr chast.Expression) string {
+	switch e := expr.(type) {
+	case *chast.Identifier:
+		return e.Name()
+	case *chast.Literal:
+		return literalText(e)
+	case *chast.FunctionCall:
+		if e.Over != nil || e.Filter != nil || e.Distinct {
+			return ""
+		}
+		var params, args []string
+		for _, p := range e.Parameters {
+			s := columnName(p)
+			if s == "" {
+				return ""
+			}
+			params = append(params, s)
+		}
+		for _, a := range e.Arguments {
+			s := columnName(a)
+			if s == "" {
+				return ""
+			}
+			args = append(args, s)
+		}
+		name := e.Name
+		if len(e.Parameters) > 0 {
+			name += "(" + strings.Join(params, ", ") + ")"
+		}
+		return name + "(" + strings.Join(args, ", ") + ")"
+	case *chast.BinaryExpr:
+		fn, ok := binaryFunctions[strings.ToUpper(e.Op)]
+		if !ok {
+			return ""
+		}
+		left, right := columnName(e.Left), columnName(e.Right)
+		if left == "" || right == "" {
+			return ""
+		}
+		return fn + "(" + left + ", " + right + ")"
+	case *chast.UnaryExpr:
+		operand := columnName(e.Operand)
+		if operand == "" {
+			return ""
+		}
+		switch strings.ToUpper(e.Op) {
+		case "-":
+			return "negate(" + operand + ")"
+		case "NOT":
+			return "not(" + operand + ")"
+		}
+		return ""
+	case *chast.IsNullExpr:
+		arg := columnName(e.Expr)
+		if arg == "" {
+			return ""
+		}
+		if e.Not {
+			return "isNotNull(" + arg + ")"
+		}
+		return "isNull(" + arg + ")"
+	case *chast.TernaryExpr:
+		cond, then, els := columnName(e.Condition), columnName(e.Then), columnName(e.Else)
+		if cond == "" || then == "" || els == "" {
+			return ""
+		}
+		return "if(" + cond + ", " + then + ", " + els + ")"
+	}
+	return ""
+}
+
+// literalText writes a literal as ClickHouse prints it in a column name.
+func literalText(l *chast.Literal) string {
+	switch l.Type {
+	case chast.LiteralString:
+		return quoteString(fmt.Sprint(l.Value))
+	case chast.LiteralNull:
+		return "NULL"
+	case chast.LiteralBoolean:
+		return fmt.Sprint(l.Value)
+	case chast.LiteralInteger, chast.LiteralFloat:
+		if l.Source != "" {
+			return l.Source
+		}
+		return fmt.Sprint(l.Value)
+	}
+	return ""
+}
+
+func quoteString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "'", `\'`)
+	return "'" + s + "'"
 }
 
 func (c *cc) convertTablesInSelectQuery(n *chast.TablesInSelectQuery) *ast.List {
@@ -340,7 +499,23 @@ func (c *cc) convertExpr(expr chast.Expression) ast.Node {
 	case *chast.BinaryExpr:
 		return c.convertBinaryExpr(e)
 	case *chast.FunctionCall:
+		switch strings.ToLower(e.Name) {
+		case "coalesce", "ifnull":
+			// COALESCE is null only when every argument is, which a seeded
+			// function signature cannot say.
+			args := &ast.List{}
+			for _, arg := range e.Arguments {
+				args.Items = append(args.Items, c.convertExpr(arg))
+			}
+			return &ast.CoalesceExpr{Args: args, Location: pos(e)}
+		}
 		return c.convertFunctionCall(e)
+	case *chast.ExistsExpr:
+		return &ast.SubLink{
+			SubLinkType: ast.EXISTS_SUBLINK,
+			Subselect:   c.convert(e.Query),
+			Location:    pos(e),
+		}
 	case *chast.AliasedExpr:
 		return c.convertExpr(e.Expr)
 	case *chast.Parameter:
@@ -380,7 +555,7 @@ func (c *cc) convertIdentifier(n *chast.Identifier) *ast.ColumnRef {
 	}
 	return &ast.ColumnRef{
 		Fields:   fields,
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 }
 
@@ -390,7 +565,7 @@ func (c *cc) convertLiteral(n *chast.Literal) *ast.A_Const {
 		str := n.Value.(string)
 		return &ast.A_Const{
 			Val:      &ast.String{Str: str},
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	case chast.LiteralInteger:
 		var ival int64
@@ -406,7 +581,7 @@ func (c *cc) convertLiteral(n *chast.Literal) *ast.A_Const {
 		}
 		return &ast.A_Const{
 			Val:      &ast.Integer{Ival: ival},
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	case chast.LiteralFloat:
 		var fval float64
@@ -419,7 +594,7 @@ func (c *cc) convertLiteral(n *chast.Literal) *ast.A_Const {
 		str := strconv.FormatFloat(fval, 'f', -1, 64)
 		return &ast.A_Const{
 			Val:      &ast.Float{Str: str},
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	case chast.LiteralBoolean:
 		// ClickHouse booleans are typically 0/1
@@ -427,21 +602,21 @@ func (c *cc) convertLiteral(n *chast.Literal) *ast.A_Const {
 		if bval {
 			return &ast.A_Const{
 				Val:      &ast.Integer{Ival: 1},
-				Location: n.Pos().Offset,
+				Location: pos(n),
 			}
 		}
 		return &ast.A_Const{
 			Val:      &ast.Integer{Ival: 0},
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	case chast.LiteralNull:
 		return &ast.A_Const{
 			Val:      &ast.Null{},
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	default:
 		return &ast.A_Const{
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	}
 }
@@ -465,18 +640,19 @@ func (c *cc) convertBinaryExpr(n *chast.BinaryExpr) ast.Node {
 					c.convertExpr(n.Right),
 				},
 			},
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	}
 
 	// Handle other operators
 	return &ast.A_Expr{
+		Kind: ast.A_Expr_Kind_OP,
 		Name: &ast.List{
 			Items: []ast.Node{&ast.String{Str: n.Op}},
 		},
 		Lexpr:    c.convertExpr(n.Left),
 		Rexpr:    c.convertExpr(n.Right),
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 }
 
@@ -485,8 +661,8 @@ func (c *cc) convertFunctionCall(n *chast.FunctionCall) *ast.FuncCall {
 		Funcname: &ast.List{
 			Items: []ast.Node{&ast.String{Str: n.Name}},
 		},
-		Location:     n.Pos().Offset,
-		AggDistinct:  n.Distinct,
+		Location:    pos(n),
+		AggDistinct: n.Distinct,
 	}
 
 	// Convert arguments
@@ -518,16 +694,34 @@ func (c *cc) convertFunctionCall(n *chast.FunctionCall) *ast.FuncCall {
 }
 
 func (c *cc) convertParameter(n *chast.Parameter) ast.Node {
-	c.paramCount++
-	// Use the parameter name if available
-	name := n.Name
-	if name == "" {
-		name = strconv.Itoa(c.paramCount)
+	number, ok := c.named[n.Name]
+	if !ok || n.Name == "" {
+		c.paramCount++
+		number = c.paramCount
+		if n.Name != "" {
+			if c.named == nil {
+				c.named = map[string]int{}
+			}
+			c.named[n.Name] = number
+		}
 	}
-	return &ast.ParamRef{
-		Number:   c.paramCount,
-		Location: n.Pos().Offset,
+	ref := &ast.ParamRef{
+		Number:   number,
+		Name:     n.Name,
+		Location: pos(n),
 	}
+	// A parameter written {name:Type} declares its type, which is what a
+	// cast of a placeholder says.
+	if n.Type != nil {
+		spelling := renderDataType(n.Type)
+		base, _, _ := unwrapTypeString(spelling)
+		return &ast.TypeCast{
+			Arg:      ref,
+			TypeName: &ast.TypeName{Name: base, Spelling: spelling, Canonical: canonicalDataType(n.Type)},
+			Location: pos(n),
+		}
+	}
+	return ref
 }
 
 func (c *cc) convertAsterisk(n *chast.Asterisk) *ast.ColumnRef {
@@ -538,13 +732,13 @@ func (c *cc) convertAsterisk(n *chast.Asterisk) *ast.ColumnRef {
 	fields.Items = append(fields.Items, &ast.A_Star{})
 	return &ast.ColumnRef{
 		Fields:   fields,
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 }
 
 func (c *cc) convertCaseExpr(n *chast.CaseExpr) *ast.CaseExpr {
 	ce := &ast.CaseExpr{
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 
 	// Convert test expression (CASE expr WHEN ...)
@@ -575,13 +769,15 @@ func (c *cc) convertCaseExpr(n *chast.CaseExpr) *ast.CaseExpr {
 func (c *cc) convertCastExpr(n *chast.CastExpr) *ast.TypeCast {
 	tc := &ast.TypeCast{
 		Arg:      c.convertExpr(n.Expr),
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 
 	if n.Type != nil {
-		tc.TypeName = &ast.TypeName{
-			Name: n.Type.Name,
-		}
+		// The whole type is handed over as its spelling, arguments and
+		// nesting included, the way a column's is.
+		spelling := renderDataType(n.Type)
+		base, _, _ := unwrapTypeString(spelling)
+		tc.TypeName = &ast.TypeName{Name: base, Spelling: spelling, Canonical: canonicalDataType(n.Type)}
 	}
 
 	return tc
@@ -593,7 +789,7 @@ func (c *cc) convertBetweenExpr(n *chast.BetweenExpr) *ast.BetweenExpr {
 		Left:     c.convertExpr(n.Low),
 		Right:    c.convertExpr(n.High),
 		Not:      n.Not,
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 }
 
@@ -601,7 +797,7 @@ func (c *cc) convertInExpr(n *chast.InExpr) *ast.In {
 	in := &ast.In{
 		Expr:     c.convertExpr(n.Expr),
 		Not:      n.Not,
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 
 	// Convert the list
@@ -623,7 +819,7 @@ func (c *cc) convertInExpr(n *chast.InExpr) *ast.In {
 func (c *cc) convertIsNullExpr(n *chast.IsNullExpr) *ast.NullTest {
 	nullTest := &ast.NullTest{
 		Arg:      c.convertExpr(n.Expr),
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 	if n.Not {
 		nullTest.Nulltesttype = ast.NullTestTypeIsNotNull
@@ -653,14 +849,17 @@ func (c *cc) convertLikeExpr(n *chast.LikeExpr) *ast.A_Expr {
 		},
 		Lexpr:    c.convertExpr(n.Expr),
 		Rexpr:    c.convertExpr(n.Pattern),
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 }
 
+// convertSubquery converts a subquery used as a value: a scalar subquery.
+// EXISTS is its own node.
 func (c *cc) convertSubquery(n *chast.Subquery) *ast.SubLink {
 	return &ast.SubLink{
-		SubLinkType: ast.EXISTS_SUBLINK,
+		SubLinkType: ast.EXPR_SUBLINK,
 		Subselect:   c.convert(n.Query),
+		Location:    pos(n),
 	}
 }
 
@@ -686,23 +885,24 @@ func (c *cc) convertUnaryExpr(n *chast.UnaryExpr) ast.Node {
 			Args: &ast.List{
 				Items: []ast.Node{c.convertExpr(n.Operand)},
 			},
-			Location: n.Pos().Offset,
+			Location: pos(n),
 		}
 	}
 
 	return &ast.A_Expr{
+		Kind: ast.A_Expr_Kind_OP,
 		Name: &ast.List{
 			Items: []ast.Node{&ast.String{Str: n.Op}},
 		},
 		Rexpr:    c.convertExpr(n.Operand),
-		Location: n.Pos().Offset,
+		Location: pos(n),
 	}
 }
 
 func (c *cc) convertOrderByElement(n *chast.OrderByElement) *ast.SortBy {
 	sortBy := &ast.SortBy{
 		Node:     c.convertExpr(n.Expression),
-		Location: n.Expression.Pos().Offset,
+		Location: pos(n.Expression),
 	}
 
 	if n.Descending {
@@ -789,8 +989,13 @@ func (c *cc) convertCreateQuery(n *chast.CreateQuery) ast.Node {
 			stmt.Name.Schema = identifier(n.Database)
 		}
 
-		// Convert columns
+		// Convert columns. A Nested column is what ClickHouse stores as
+		// one array column per element, named n.a, and reports as those.
 		for _, col := range n.Columns {
+			if cols, ok := c.convertNestedColumn(col); ok {
+				stmt.Cols = append(stmt.Cols, cols...)
+				continue
+			}
 			colDef := c.convertColumnDeclaration(col)
 			stmt.Cols = append(stmt.Cols, colDef)
 		}
@@ -818,6 +1023,30 @@ func (c *cc) convertCreateQuery(n *chast.CreateQuery) ast.Node {
 	return &ast.TODO{}
 }
 
+// convertNestedColumn expands a column declared Nested(a T, b U) into the
+// columns n.a Array(T) and n.b Array(U), which is how ClickHouse's
+// system.columns lists it and what a query selects.
+func (c *cc) convertNestedColumn(n *chast.ColumnDeclaration) ([]*ast.ColumnDef, bool) {
+	if n.Type == nil || !strings.EqualFold(n.Type.Name, "Nested") {
+		return nil, false
+	}
+	var cols []*ast.ColumnDef
+	for _, p := range n.Type.Parameters {
+		pair, ok := p.(*chast.NameTypePair)
+		if !ok {
+			continue
+		}
+		spelling := "Array(" + renderDataType(pair.Type) + ")"
+		cols = append(cols, &ast.ColumnDef{
+			Colname:   identifier(n.Name) + "." + identifier(pair.Name),
+			TypeName:  &ast.TypeName{Name: "array", Spelling: spelling, Canonical: "Array(" + canonicalDataType(pair.Type) + ")"},
+			IsArray:   true,
+			IsNotNull: true,
+		})
+	}
+	return cols, len(cols) > 0
+}
+
 func (c *cc) convertColumnDeclaration(n *chast.ColumnDeclaration) *ast.ColumnDef {
 	colDef := &ast.ColumnDef{
 		Colname:   identifier(n.Name),
@@ -825,15 +1054,14 @@ func (c *cc) convertColumnDeclaration(n *chast.ColumnDeclaration) *ast.ColumnDef
 	}
 
 	if n.Type != nil {
-		colDef.TypeName = &ast.TypeName{
-			Name: n.Type.Name,
-		}
-		// Handle type parameters (e.g., Decimal(10, 2))
-		if len(n.Type.Parameters) > 0 {
-			colDef.TypeName.Typmods = &ast.List{}
-			for _, param := range n.Type.Parameters {
-				colDef.TypeName.Typmods.Items = append(colDef.TypeName.Typmods.Items, c.convertExpr(param))
-			}
+		spelling := renderDataType(n.Type)
+		base, isArray, nullable := unwrapTypeString(spelling)
+		// The catalog resolves the base type; the full spelling, with its
+		// arguments and nesting, is kept for the analysis to report.
+		colDef.TypeName = &ast.TypeName{Name: base, Spelling: spelling, Canonical: canonicalDataType(n.Type)}
+		colDef.IsArray = isArray
+		if nullable {
+			colDef.IsNotNull = false
 		}
 	}
 
@@ -853,6 +1081,169 @@ func (c *cc) convertColumnDeclaration(n *chast.ColumnDeclaration) *ast.ColumnDef
 	}
 
 	return colDef
+}
+
+// renderDataType spells a type as the author wrote it, which the formatter
+// prints back.
+func renderDataType(dt *chast.DataType) string {
+	return renderType(dt, false)
+}
+
+// canonicalDataType spells a type the way ClickHouse stores it, which the
+// analysis core reads: an Enum's members are numbered and the family
+// sized by their count, a Variant's members are sorted, and a named
+// element is written label first, so that Enum('a', 'b') is Enum8('a' =
+// 1, 'b' = 2), Variant(String, Int64) is Variant(Int64, String) and
+// Tuple(lat Float64) is Tuple(lat: Float64).
+func canonicalDataType(dt *chast.DataType) string {
+	return renderType(dt, true)
+}
+
+func renderType(dt *chast.DataType, canonical bool) string {
+	if dt == nil {
+		return ""
+	}
+	if len(dt.Parameters) == 0 {
+		return dt.Name
+	}
+	name := dt.Name
+	parts := make([]string, 0, len(dt.Parameters))
+	switch lower := strings.ToLower(name); {
+	case canonical && (lower == "enum" || lower == "enum8" || lower == "enum16"):
+		if lower == "enum" {
+			name = "Enum8"
+			if len(dt.Parameters) > 127 {
+				name = "Enum16"
+			}
+		}
+		next := int64(1)
+		for _, p := range dt.Parameters {
+			switch v := p.(type) {
+			case *chast.BinaryExpr:
+				// 'a' = 3 numbers itself, and the next bare member follows it.
+				parts = append(parts, renderParam(v, canonical))
+				if lit, ok := v.Right.(*chast.Literal); ok {
+					if n, err := strconv.ParseInt(fmt.Sprint(lit.Value), 10, 64); err == nil {
+						next = n + 1
+					}
+				}
+			default:
+				parts = append(parts, renderParam(p, canonical)+" = "+strconv.FormatInt(next, 10))
+				next++
+			}
+		}
+	case canonical && lower == "lowcardinality" && len(dt.Parameters) == 1:
+		// ClickHouse spells a nullable low-cardinality column as
+		// LowCardinality(Nullable(T)), the only order it accepts. The
+		// nullability is the column's, so the canonical form is
+		// Nullable(LowCardinality(T)), which reads as a nullable
+		// LowCardinality(T).
+		if inner, ok := dt.Parameters[0].(*chast.DataType); ok && strings.EqualFold(inner.Name, "nullable") && len(inner.Parameters) == 1 {
+			return "Nullable(LowCardinality(" + renderParam(inner.Parameters[0], canonical) + "))"
+		}
+		parts = append(parts, renderParam(dt.Parameters[0], canonical))
+	case canonical && lower == "variant":
+		for _, p := range dt.Parameters {
+			parts = append(parts, renderParam(p, canonical))
+		}
+		sort.Strings(parts)
+	default:
+		for _, p := range dt.Parameters {
+			parts = append(parts, renderParam(p, canonical))
+		}
+	}
+	return name + "(" + strings.Join(parts, ", ") + ")"
+}
+
+func renderTypeParam(e chast.Expression) string {
+	return renderParam(e, false)
+}
+
+func renderParam(e chast.Expression, canonical bool) string {
+	switch v := e.(type) {
+	case *chast.DataType:
+		return renderType(v, canonical)
+	case *chast.Literal:
+		if v.Type == chast.LiteralString {
+			return quoteString(fmt.Sprint(v.Value))
+		}
+		if v.Source != "" {
+			return v.Source
+		}
+		return fmt.Sprintf("%v", v.Value)
+	case *chast.Identifier:
+		return strings.Join(v.Parts, ".")
+	case *chast.NameTypePair:
+		// A named tuple or nested element: `lat Float64`, or `lat: Float64`
+		// in the canonical form.
+		if canonical {
+			return v.Name + ": " + renderType(v.Type, canonical)
+		}
+		return v.Name + " " + renderType(v.Type, canonical)
+	case *chast.BinaryExpr:
+		// An enum member: `'active' = 1`.
+		return renderParam(v.Left, canonical) + " " + v.Op + " " + renderParam(v.Right, canonical)
+	default:
+		return ""
+	}
+}
+
+func unwrapTypeString(s string) (name string, isArray, nullable bool) {
+	base, args := splitType(s)
+	switch strings.ToLower(base) {
+	case "nullable":
+		if len(args) == 1 {
+			inner, arr, _ := unwrapTypeString(args[0])
+			return inner, arr, true
+		}
+		return strings.ToLower(base), false, true
+	case "lowcardinality":
+		// LowCardinality is an encoding of the type it wraps, and a
+		// column of LowCardinality(Nullable(String)) holds NULLs.
+		if len(args) == 1 {
+			return unwrapTypeString(args[0])
+		}
+		return strings.ToLower(base), false, false
+	case "array":
+		if len(args) == 1 {
+			inner, _, _ := unwrapTypeString(args[0])
+			return inner, true, false
+		}
+		return strings.ToLower(base), true, false
+	default:
+		if strings.TrimSpace(base) == "" {
+			return "nothing", false, false
+		}
+		return strings.ToLower(base), false, false
+	}
+}
+
+func splitType(s string) (base string, args []string) {
+	s = strings.TrimSpace(s)
+	open := strings.IndexByte(s, '(')
+	if open < 0 || !strings.HasSuffix(s, ")") {
+		return s, nil
+	}
+	base = strings.TrimSpace(s[:open])
+	inner := s[open+1 : len(s)-1]
+	depth, start := 0, 0
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				args = append(args, strings.TrimSpace(inner[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if last := strings.TrimSpace(inner[start:]); last != "" {
+		args = append(args, last)
+	}
+	return base, args
 }
 
 func (c *cc) convertUpdateQuery(n *chast.UpdateQuery) *ast.UpdateStmt {
