@@ -2,6 +2,7 @@ package golang
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/sqlc-dev/sqlc/internal/codegen/golang/opts"
@@ -14,9 +15,20 @@ type QueryValue struct {
 	EmitPointer bool
 	Name        string
 	DBName      string // The name of the field in the database. Only set if Struct==nil.
+	ParamName   string // The name of the placeholder a parameter is bound by, when the query names it. Only set if Struct==nil.
 	Struct      *Struct
 	Typ         string
 	SQLDriver   opts.SQLDriver
+	Engine      string
+
+	// NamedArgs is set when the query's placeholders name their parameters,
+	// as SQL Server's and Spanner's @name and ClickHouse's {name:Type} do,
+	// so each argument is passed as sql.Named with that name.
+	NamedArgs bool
+
+	// ModelQualifier prefixes references to model types when the models file
+	// lives in a different Go package (e.g. "model."). Empty otherwise.
+	ModelQualifier string
 
 	// Column is kept so late in the generation process around to differentiate
 	// between mysql slices and pg arrays
@@ -88,6 +100,14 @@ func (v QueryValue) Type() string {
 		return v.Typ
 	}
 	if v.Struct != nil {
+		// Model structs (table-derived) live in the models file. When that
+		// file is generated into a different Go package, references from
+		// query files must be qualified. Synthetic structs (Params/Row)
+		// are defined in the same query file as their use, so they stay
+		// bare.
+		if v.Struct.IsModel && v.ModelQualifier != "" {
+			return v.ModelQualifier + v.Struct.Name
+		}
 		return v.Struct.Name
 	}
 	panic("no type for QueryValue: " + v.Name)
@@ -123,23 +143,37 @@ func (v QueryValue) UniqueFields() []Field {
 	return fields
 }
 
+// pqArrays reports whether the value's slices go through pq.Array.
+func (v QueryValue) pqArrays() bool {
+	return usesPqArrays(v.Engine, v.SQLDriver)
+}
+
+// namedArg is the argument expr passed for the parameter the query names
+// name, wrapped in sql.Named when the query's placeholders are named.
+func (v QueryValue) namedArg(name, expr string) string {
+	if !v.NamedArgs {
+		return expr
+	}
+	return "sql.Named(" + strconv.Quote(name) + ", " + expr + ")"
+}
+
 func (v QueryValue) Params() string {
 	if v.isEmpty() {
 		return ""
 	}
 	var out []string
 	if v.Struct == nil {
-		if !v.Column.IsSqlcSlice && strings.HasPrefix(v.Typ, "[]") && v.Typ != "[]byte" && !v.SQLDriver.IsPGX() {
+		if !v.Column.IsSqlcSlice && strings.HasPrefix(v.Typ, "[]") && v.Typ != "[]byte" && v.pqArrays() {
 			out = append(out, "pq.Array("+escape(v.Name)+")")
 		} else {
-			out = append(out, escape(v.Name))
+			out = append(out, v.namedArg(v.ParamName, escape(v.Name)))
 		}
 	} else {
 		for _, f := range v.Struct.Fields {
-			if !f.HasSqlcSlice() && strings.HasPrefix(f.Type, "[]") && f.Type != "[]byte" && !v.SQLDriver.IsPGX() {
+			if !f.HasSqlcSlice() && strings.HasPrefix(f.Type, "[]") && f.Type != "[]byte" && v.pqArrays() {
 				out = append(out, "pq.Array("+escape(v.VariableForField(f))+")")
 			} else {
-				out = append(out, escape(v.VariableForField(f)))
+				out = append(out, v.namedArg(f.ParamName, escape(v.VariableForField(f))))
 			}
 		}
 	}
@@ -193,7 +227,7 @@ func (v QueryValue) HasSqlcSlices() bool {
 func (v QueryValue) Scan() string {
 	var out []string
 	if v.Struct == nil {
-		if strings.HasPrefix(v.Typ, "[]") && v.Typ != "[]byte" && !v.SQLDriver.IsPGX() {
+		if strings.HasPrefix(v.Typ, "[]") && v.Typ != "[]byte" && v.pqArrays() {
 			out = append(out, "pq.Array(&"+v.Name+")")
 		} else {
 			out = append(out, "&"+v.Name)
@@ -204,7 +238,7 @@ func (v QueryValue) Scan() string {
 			// append any embedded fields
 			if len(f.EmbedFields) > 0 {
 				for _, embed := range f.EmbedFields {
-					if strings.HasPrefix(embed.Type, "[]") && embed.Type != "[]byte" && !v.SQLDriver.IsPGX() {
+					if strings.HasPrefix(embed.Type, "[]") && embed.Type != "[]byte" && v.pqArrays() {
 						out = append(out, "pq.Array(&"+v.Name+"."+f.Name+"."+embed.Name+")")
 					} else {
 						out = append(out, "&"+v.Name+"."+f.Name+"."+embed.Name)
@@ -213,7 +247,7 @@ func (v QueryValue) Scan() string {
 				continue
 			}
 
-			if strings.HasPrefix(f.Type, "[]") && f.Type != "[]byte" && !v.SQLDriver.IsPGX() {
+			if strings.HasPrefix(f.Type, "[]") && f.Type != "[]byte" && v.pqArrays() {
 				out = append(out, "pq.Array(&"+v.Name+"."+f.Name+")")
 			} else {
 				out = append(out, "&"+v.Name+"."+f.Name)

@@ -1,0 +1,252 @@
+package analyzer
+
+import (
+	"fmt"
+
+	"github.com/sqlc-dev/sqlc/internal/core"
+	"github.com/sqlc-dev/sqlc/internal/sql/ast"
+)
+
+type scope struct {
+	rels []scopeRel
+}
+
+type scopeRel struct {
+	alias    string
+	classOID int64
+	// cols is the catalog's column list, held as-is rather than copied into a
+	// scope-local column type.
+	cols []core.ClassColumn
+}
+
+func (a *analyzer) buildScope(from *ast.List) (*scope, error) {
+	items := listItems(from)
+	sc := &scope{rels: make([]scopeRel, 0, len(items))}
+	defer a.binding(sc)()
+	for _, item := range items {
+		if err := a.appendFromItem(sc, item); err != nil {
+			return nil, err
+		}
+	}
+	return sc, nil
+}
+
+// binding makes the scope under construction the one the analyzer resolves
+// against, and returns the func that puts back the scope it replaced. A FROM
+// item can refer to the ones before it — a set-returning function takes its
+// arguments from them — so binding an item has to see what is bound so far
+// rather than no scope at all.
+func (a *analyzer) binding(sc *scope) func() {
+	prev := a.scope
+	a.scope = sc
+	return func() { a.scope = prev }
+}
+
+func (a *analyzer) appendFromItem(sc *scope, item ast.Node) error {
+	switch v := item.(type) {
+	case *ast.RangeVar:
+		rel, err := a.bindRangeVar(v)
+		if err != nil {
+			return err
+		}
+		sc.rels = append(sc.rels, rel)
+		return nil
+	case *ast.JoinExpr:
+		if err := a.appendFromItem(sc, v.Larg); err != nil {
+			return err
+		}
+		return a.appendFromItem(sc, v.Rarg)
+	case *ast.RangeFunction:
+		rel, err := a.bindRangeFunction(v)
+		if err != nil {
+			return err
+		}
+		sc.rels = append(sc.rels, rel)
+		return nil
+	case *ast.RangeSubselect:
+		rel, err := a.bindRangeSubselect(v)
+		if err != nil {
+			return err
+		}
+		sc.rels = append(sc.rels, rel)
+		return nil
+	case *ast.List:
+		// Some engines report a comma-separated FROM as a nested list.
+		for _, item := range listItems(v) {
+			if err := a.appendFromItem(sc, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("scope: unsupported FROM item %T", item)
+	}
+}
+
+// bindRangeFunction binds a function called in FROM. A set-returning function
+// stands in for a relation of a single column named after it.
+func (a *analyzer) bindRangeFunction(rf *ast.RangeFunction) (scopeRel, error) {
+	call := findFuncCall(rf.Functions)
+	if call == nil {
+		return scopeRel{}, fmt.Errorf("range function: no function call")
+	}
+	name := funcCallName(call)
+	overloads, err := a.cat.FindProcs(name, nil)
+	if err != nil {
+		return scopeRel{}, err
+	}
+	if len(overloads) == 0 {
+		return scopeRel{}, fmt.Errorf("unknown function %q", name)
+	}
+
+	// The arguments are typed against the scope built so far, which is what
+	// gives a placeholder passed to the function its type, and what
+	// resolves a polymorphic result: unnest of an array of strings yields
+	// strings.
+	t, err := a.typeFuncCall(call)
+	if err != nil {
+		return scopeRel{}, err
+	}
+
+	// The relation's alias names its single column too, as "unnest(tags)
+	// AS tag" does.
+	colName := name
+	rel := scopeRel{alias: name}
+	if rf.Alias != nil && rf.Alias.Aliasname != nil && *rf.Alias.Aliasname != "" {
+		rel.alias = *rf.Alias.Aliasname
+		colName = rel.alias
+	}
+	col := core.ClassColumn{Name: colName, TypeOID: t.typeOID, Type: t.expr, NotNull: !t.nullable}
+	if t.typeOID == 0 && t.expr == nil {
+		p := overloads[0]
+		col.TypeOID, col.NotNull = p.ReturnTypeOID, !p.ReturnNullable
+	}
+	rel.cols = []core.ClassColumn{col}
+	return rel, nil
+}
+
+func findFuncCall(l *ast.List) *ast.FuncCall {
+	for _, item := range listItems(l) {
+		switch v := item.(type) {
+		case *ast.FuncCall:
+			return v
+		case *ast.List:
+			if call := findFuncCall(v); call != nil {
+				return call
+			}
+		}
+	}
+	return nil
+}
+
+// bindRangeSubselect binds a subquery used as a relation in FROM.
+func (a *analyzer) bindRangeSubselect(rs *ast.RangeSubselect) (scopeRel, error) {
+	sel, ok := rs.Subquery.(*ast.SelectStmt)
+	if !ok {
+		return scopeRel{}, fmt.Errorf("subquery: unsupported %T", rs.Subquery)
+	}
+	cols, err := a.subqueryColumns(sel)
+	if err != nil {
+		return scopeRel{}, err
+	}
+	alias := ""
+	if rs.Alias != nil && rs.Alias.Aliasname != nil {
+		alias = *rs.Alias.Aliasname
+	}
+	rel := derivedRel(alias, cols)
+	if rs.Alias != nil {
+		renameColumns(&rel, rs.Alias.Colnames)
+	}
+	return rel, nil
+}
+
+func (a *analyzer) bindRangeVar(rv *ast.RangeVar) (scopeRel, error) {
+	if rv.Relname == nil {
+		return scopeRel{}, fmt.Errorf("range var: missing relation name")
+	}
+	relName := *rv.Relname
+
+	// A WITH clause defines a relation that shadows nothing but is not in the
+	// catalog, so it is resolved before one.
+	if cte, ok := a.ctes[relName]; ok && (rv.Schemaname == nil || *rv.Schemaname == "") {
+		if rv.Alias != nil && rv.Alias.Aliasname != nil && *rv.Alias.Aliasname != "" {
+			cte.alias = *rv.Alias.Aliasname
+		}
+		return cte, nil
+	}
+
+	schema := ""
+	if rv.Schemaname != nil {
+		schema = *rv.Schemaname
+	}
+	if schema == "" {
+		schema = "public"
+	}
+	nsOID, err := a.cat.NamespaceOID(schema)
+	if err != nil {
+		return scopeRel{}, fmt.Errorf("schema %q: %w", schema, err)
+	}
+	classOID, err := a.cat.ClassOID(nsOID, relName)
+	if err != nil {
+		return scopeRel{}, fmt.Errorf("relation %q.%q: %w", schema, relName, err)
+	}
+	rel := scopeRel{
+		alias:    relName,
+		classOID: classOID,
+	}
+	if rv.Alias != nil && rv.Alias.Aliasname != nil && *rv.Alias.Aliasname != "" {
+		rel.alias = *rv.Alias.Aliasname
+	}
+
+	cols, err := a.cat.ClassColumns(classOID)
+	if err != nil {
+		return scopeRel{}, err
+	}
+	rel.cols = cols
+	return rel, nil
+}
+
+// resolveColumn finds a column in this query's scope, falling back to the scope
+// of the query it is nested in, which is what a correlated subquery refers to.
+func (a *analyzer) resolveColumn(relation, column string) (scopeRel, core.ClassColumn, bool, error) {
+	rel, col, ok, err := a.scope.resolveColumn(relation, column)
+	if err != nil || ok {
+		return rel, col, ok, err
+	}
+	if a.outer != nil {
+		return a.outer.resolveColumn(relation, column)
+	}
+	return rel, col, false, nil
+}
+
+// resolveColumn finds the single column named column, optionally qualified by
+// relation. It reports an error when more than one relation in scope offers
+// that name.
+func (s *scope) resolveColumn(relation, column string) (rel scopeRel, col core.ClassColumn, ok bool, err error) {
+	// A statement whose scope is not built yet offers no columns. Report the
+	// column as unresolved and let the caller say so, rather than crashing on
+	// the way to the same answer.
+	if s == nil {
+		return rel, col, false, nil
+	}
+	found := 0
+	for _, r := range s.rels {
+		if relation != "" && r.alias != relation {
+			continue
+		}
+		for _, c := range r.cols {
+			if c.Name != column {
+				continue
+			}
+			found++
+			if found > 1 {
+				return scopeRel{}, core.ClassColumn{}, false, fmt.Errorf("ambiguous column reference %q", column)
+			}
+			rel, col = r, c
+		}
+	}
+	if found == 0 {
+		return scopeRel{}, core.ClassColumn{}, false, nil
+	}
+	return rel, col, true, nil
+}

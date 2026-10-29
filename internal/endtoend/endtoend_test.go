@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -17,9 +18,25 @@ import (
 	"github.com/sqlc-dev/sqlc/internal/cmd"
 	"github.com/sqlc-dev/sqlc/internal/config"
 	"github.com/sqlc-dev/sqlc/internal/opts"
+	"github.com/sqlc-dev/sqlc/internal/sqlcdebug"
 	"github.com/sqlc-dev/sqlc/internal/sqltest/docker"
 	"github.com/sqlc-dev/sqlc/internal/sqltest/native"
 )
+
+// withSQLCDEBUG installs the given SQLCDEBUG-formatted string for the
+// duration of the test and restores the empty default afterwards.
+//
+// Callers in TestReplay are sequential, so this does not need a mutex:
+// Go's test scheduler does not run TestReplay concurrently with the
+// parallel top-level tests in this package.
+func withSQLCDEBUG(t *testing.T, raw string) func() {
+	t.Helper()
+	if raw == "" {
+		return func() {}
+	}
+	sqlcdebug.Update(raw)
+	return func() { sqlcdebug.Update("") }
+}
 
 func lineEndings() cmp.Option {
 	return cmp.Transformer("LineEndings", func(in string) string {
@@ -54,6 +71,9 @@ func TestExamples(t *testing.T) {
 			continue
 		}
 		tc := replay.Name()
+		if !isExample(filepath.Join(examples, tc)) {
+			continue
+		}
 		t.Run(tc, func(t *testing.T) {
 			t.Parallel()
 			path := filepath.Join(examples, tc)
@@ -103,6 +123,10 @@ func BenchmarkExamples(b *testing.B) {
 type textContext struct {
 	Mutate  func(*testing.T, string) func(*config.Config)
 	Enabled func() bool
+	// Experiments names the experiments every case in this context runs
+	// with. A case's own SQLCEXPERIMENT is appended to these, so a case can
+	// still turn one back off with the "no" prefix.
+	Experiments func() []string
 }
 
 func TestReplay(t *testing.T) {
@@ -218,11 +242,19 @@ func TestReplay(t *testing.T) {
 				return postgresURI != "" || mysqlURI != ""
 			},
 		},
+		"core": {
+			Mutate:      func(t *testing.T, path string) func(*config.Config) { return func(c *config.Config) {} },
+			Experiments: func() []string { return []string{"coreanalyzer"} },
+			Enabled: func() bool {
+				// Running the whole corpus through the analysis core is opt-in
+				// while the two paths still disagree. The core needs no
+				// database, so nothing else gates this.
+				return os.Getenv("SQLC_TEST_CORE") != ""
+			},
+		},
 	}
 
 	for name, testctx := range contexts {
-		name := name
-		testctx := testctx
 
 		if !testctx.Enabled() {
 			continue
@@ -261,15 +293,21 @@ func TestReplay(t *testing.T) {
 					}
 				}
 
+				experiments := args.Env["SQLCEXPERIMENT"]
+				if testctx.Experiments != nil {
+					experiments = strings.Join(append(testctx.Experiments(), experiments), ",")
+				}
+
 				opts := cmd.Options{
 					Env: cmd.Env{
-						Debug:      opts.DebugFromString(args.Env["SQLCDEBUG"]),
-						Experiment: opts.ExperimentFromString(args.Env["SQLCEXPERIMENT"]),
-						NoRemote:   true,
+						Experiment: opts.ExperimentFromString(experiments),
 					},
 					Stderr:       &stderr,
 					MutateConfig: testctx.Mutate(t, path),
 				}
+
+				release := withSQLCDEBUG(t, args.Env["SQLCDEBUG"])
+				defer release()
 
 				switch args.Command {
 				case "diff":
@@ -281,6 +319,29 @@ func TestReplay(t *testing.T) {
 					}
 				case "vet":
 					err = cmd.Vet(ctx, path, "", &opts)
+				case "parse", "analyze", "fmt":
+					// These commands are flag-driven (fmt cases pass --diff so
+					// nothing is rewritten). Run them through the real CLI
+					// entry point from inside the test directory so file
+					// arguments resolve and the output stays independent of
+					// the absolute path.
+					var stdout bytes.Buffer
+					wd, werr := os.Getwd()
+					if werr != nil {
+						t.Fatal(werr)
+					}
+					if cerr := os.Chdir(path); cerr != nil {
+						t.Fatal(cerr)
+					}
+					code := cmd.Do(append([]string{args.Command}, args.Args...), nil, &stdout, &stderr)
+					if cerr := os.Chdir(wd); cerr != nil {
+						t.Fatal(cerr)
+					}
+					if code != 0 {
+						err = fmt.Errorf("%s exited with code %d", args.Command, code)
+					} else if diff := cmp.Diff(strings.TrimSpace(string(tc.Stdout)), strings.TrimSpace(stdout.String()), lineEndings()); diff != "" {
+						t.Errorf("stdout differed (-want +got):\n%s", diff)
+					}
 				default:
 					t.Fatalf("unknown command")
 				}
@@ -354,7 +415,6 @@ func cmpDirectory(t *testing.T, dir string, actual map[string]string) {
 	if !cmp.Equal(expected, actual, opts...) {
 		t.Errorf("%s contents differ", dir)
 		for name, contents := range expected {
-			name := name
 			if actual[name] == "" {
 				t.Errorf("%s is empty", name)
 				return
@@ -396,4 +456,16 @@ func BenchmarkReplay(b *testing.B) {
 			}
 		})
 	}
+}
+
+// isExample reports whether a directory under examples is an example: one
+// with a sqlc configuration file. The examples module also holds packages
+// the examples' tests share, which have none.
+func isExample(dir string) bool {
+	for _, name := range []string{"sqlc.yaml", "sqlc.yml", "sqlc.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			return true
+		}
+	}
+	return false
 }

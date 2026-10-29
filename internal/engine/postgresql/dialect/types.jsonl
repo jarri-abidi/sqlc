@@ -1,0 +1,48 @@
+{"name": "boolean", "category": "B", "aliases": ["bool"]}
+{"name": "smallint", "category": "N", "aliases": ["int2", "smallserial", "serial2"]}
+{"name": "integer", "category": "N", "aliases": ["int4", "int", "serial", "serial4"]}
+{"name": "bigint", "category": "N", "aliases": ["int8", "bigserial", "serial8"]}
+{"name": "real", "category": "N", "aliases": ["float4"]}
+{"name": "double precision", "category": "N", "aliases": ["float8"]}
+{"name": "numeric", "category": "N", "aliases": ["decimal"]}
+{"name": "money", "category": "N"}
+{"name": "oid", "category": "N"}
+{"name": "text", "category": "S"}
+{"name": "character varying", "category": "S", "aliases": ["varchar"]}
+{"name": "character", "category": "S", "aliases": ["bpchar", "char"]}
+{"name": "name", "category": "S"}
+{"name": "citext", "category": "S"}
+{"name": "date", "category": "D"}
+{"name": "time without time zone", "category": "D", "aliases": ["time"]}
+{"name": "time with time zone", "category": "D", "aliases": ["timetz"]}
+{"name": "timestamp without time zone", "category": "D", "aliases": ["timestamp"]}
+{"name": "timestamp with time zone", "category": "D", "aliases": ["timestamptz"]}
+{"name": "interval", "category": "T"}
+{"name": "uuid", "category": "U"}
+{"name": "bytea", "category": "U"}
+{"name": "json", "category": "U"}
+{"name": "jsonb", "category": "U"}
+{"name": "xml", "category": "U"}
+{"name": "inet", "category": "U"}
+{"name": "cidr", "category": "U"}
+{"name": "macaddr", "category": "U"}
+{"name": "macaddr8", "category": "U"}
+{"name": "bit", "category": "U"}
+{"name": "bit varying", "category": "U", "aliases": ["varbit"]}
+{"name": "tsvector", "category": "U"}
+{"name": "tsquery", "category": "U"}
+{"name": "point", "category": "U"}
+{"name": "line", "category": "U"}
+{"name": "lseg", "category": "U"}
+{"name": "box", "category": "U"}
+{"name": "path", "category": "U"}
+{"name": "polygon", "category": "U"}
+{"name": "circle", "category": "U"}
+{"name": "int4range", "category": "U"}
+{"name": "int8range", "category": "U"}
+{"name": "numrange", "category": "U"}
+{"name": "tsrange", "category": "U"}
+{"name": "tstzrange", "category": "U"}
+{"name": "daterange", "category": "U"}
+{"name": "anyarray", "category": "A"}
+{"name": "array", "category": "A"}

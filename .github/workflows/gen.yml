@@ -1,13 +1,13 @@
-name: sqlc-pg-gen
+name: gen
 on:
   workflow_dispatch:
 jobs:
-  gen:
-    name: sqlc-pg-gen
-    runs-on: ubuntu-22.04
+  postgresql:
+    name: generate postgresql dialect
+    runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:15.0-alpine
+        image: postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -17,23 +17,176 @@ jobs:
         # needed because the postgres container does not provide a healthcheck
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
     steps:
-    - uses: actions/checkout@v6
-    - uses: actions/setup-go@v6
+    - uses: actions/checkout@v7
+    - uses: actions/setup-go@v7
       with:
-        go-version-file: go.mod
+        go-version-file: internal/goldeneye/go.mod
         check-latest: true
-    - run: go build -o sqlc-pg-gen ./internal/tools/sqlc-pg-gen
-    - run: mkdir -p gen/contrib
-    - run: ./sqlc-pg-gen gen
+    - run: go run ./cmd/goldeneye generate postgresql
+      working-directory: internal/goldeneye
       env:
-        PG_USER: postgres
-        PG_HOST: localhost
-        PG_DATABASE: postgres
-        PG_PASSWORD: postgres
-        PG_PORT: ${{ job.services.postgres.ports['5432'] }}
+        POSTGRESQL_SERVER_URI: postgres://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/postgres?sslmode=disable
     - name: Save results
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
-        name: sqlc-pg-gen-results
-        path: gen
+        name: dialect-postgresql
+        path: internal/engine/postgresql/dialect
+    - name: Fail if the committed dialect differs
+      run: git add -N internal/engine/postgresql && git diff --exit-code --stat -- internal/engine/postgresql
 
+  mysql:
+    name: generate mysql dialect
+    runs-on: ubuntu-24.04
+    services:
+      mysql:
+        image: mysql:26.7
+        env:
+          MYSQL_ROOT_PASSWORD: mysecretpassword
+        ports:
+        - 3306:3306
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -pmysecretpassword" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: internal/goldeneye/go.mod
+        check-latest: true
+    - run: go run ./cmd/goldeneye generate mysql
+      working-directory: internal/goldeneye
+      env:
+        MYSQL_SERVER_URI: root:mysecretpassword@tcp(localhost:${{ job.services.mysql.ports['3306'] }})/mysql
+    - name: Save results
+      uses: actions/upload-artifact@v7
+      with:
+        name: dialect-mysql
+        path: internal/engine/dolphin/dialect
+    - name: Fail if the committed dialect differs
+      run: git add -N internal/engine/dolphin && git diff --exit-code --stat -- internal/engine/dolphin
+
+  clickhouse:
+    name: generate clickhouse dialect
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: internal/goldeneye/go.mod
+        check-latest: true
+    - run: go run ./cmd/goldeneye install clickhouse
+      working-directory: internal/goldeneye
+    - run: go run ./cmd/goldeneye generate clickhouse
+      working-directory: internal/goldeneye
+    - name: Save results
+      uses: actions/upload-artifact@v7
+      with:
+        name: dialect-clickhouse
+        path: internal/engine/clickhouse/dialect
+    - name: Fail if the committed dialect differs
+      run: git add -N internal/engine/clickhouse && git diff --exit-code --stat -- internal/engine/clickhouse
+
+  sqlite:
+    name: generate sqlite dialect
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: internal/goldeneye/go.mod
+        check-latest: true
+    - run: go run ./cmd/goldeneye install sqlite
+      working-directory: internal/goldeneye
+    - run: go run ./cmd/goldeneye generate sqlite
+      working-directory: internal/goldeneye
+    - name: Save results
+      uses: actions/upload-artifact@v7
+      with:
+        name: dialect-sqlite
+        path: internal/engine/sqlite/dialect
+    - name: Fail if the committed dialect differs
+      run: git add -N internal/engine/sqlite && git diff --exit-code --stat -- internal/engine/sqlite
+
+  mssql:
+    name: generate mssql dialect
+    runs-on: ubuntu-24.04
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: Mysecretpassword1!
+        ports:
+        - 1433:1433
+        options: --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Mysecretpassword1!' -Q 'SELECT 1'" --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: internal/goldeneye/go.mod
+        check-latest: true
+    - run: go run ./cmd/goldeneye generate mssql
+      working-directory: internal/goldeneye
+      env:
+        MSSQL_SERVER_URI: sqlserver://sa:Mysecretpassword1!@localhost:${{ job.services.mssql.ports['1433'] }}?encrypt=disable
+    - name: Save results
+      uses: actions/upload-artifact@v7
+      with:
+        name: dialect-mssql
+        path: internal/engine/mssql/dialect
+    - name: Fail if the committed dialect differs
+      run: git add -N internal/engine/mssql && git diff --exit-code --stat -- internal/engine/mssql
+
+  spanner:
+    name: generate googlesql dialect
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: internal/goldeneye/go.mod
+        check-latest: true
+    # Spanner Omni is run the way its quickstart runs it, on the host
+    # network, since a service container cannot be given a command.
+    - name: Start Spanner Omni
+      run: |
+        docker run -d --name spanneromni --network host us-docker.pkg.dev/spanner-omni/images/spanner-omni:2026.r2.1-beta start-single-server
+        for i in $(seq 1 60); do
+          if docker exec spanneromni /google/spanner/bin/spanner databases list >/dev/null 2>&1; then exit 0; fi
+          sleep 5
+        done
+        docker logs spanneromni
+        exit 1
+    - run: go run ./cmd/goldeneye generate spanner
+      working-directory: internal/goldeneye
+      env:
+        SPANNER_SERVER_URI: localhost:15000
+    - name: Save results
+      uses: actions/upload-artifact@v7
+      with:
+        name: dialect-googlesql
+        path: internal/engine/googlesql/dialect
+    - name: Fail if the committed dialect differs
+      run: git add -N internal/engine/googlesql && git diff --exit-code --stat -- internal/engine/googlesql
+
+  duckdb:
+    name: generate duckdb dialect
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: internal/goldeneye/go.mod
+        check-latest: true
+    # The current build of DuckDB's v2.0 preview channel, until 2.0 is
+    # released: a later build than the dialect was generated from shows up
+    # as a difference.
+    - run: go run ./cmd/goldeneye install duckdb
+      working-directory: internal/goldeneye
+    - run: go run ./cmd/goldeneye generate duckdb
+      working-directory: internal/goldeneye
+    - name: Save results
+      uses: actions/upload-artifact@v7
+      with:
+        name: dialect-duckdb
+        path: internal/engine/duckdb/dialect
+    - name: Fail if the committed dialect differs
+      run: git add -N internal/engine/duckdb && git diff --exit-code --stat -- internal/engine/duckdb

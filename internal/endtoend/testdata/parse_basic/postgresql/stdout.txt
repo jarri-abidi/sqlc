@@ -1,0 +1,69 @@
+[
+  {
+    "name": "GetValue",
+    "cmd": ":one",
+    "ast": {
+      "tag": "RawStmt",
+      "stmt": {
+        "tag": "SelectStmt",
+        "distinct_clause": {
+          "tag": "List"
+        },
+        "target_list": {
+          "tag": "List",
+          "items": [
+            {
+              "tag": "ResTarget",
+              "indirection": {
+                "tag": "List"
+              },
+              "val": {
+                "tag": "A_Const",
+                "val": {
+                  "tag": "Integer",
+                  "ival": 1
+                },
+                "location": 30
+              },
+              "location": 30
+            }
+          ]
+        },
+        "from_clause": {
+          "tag": "List"
+        },
+        "where_clause": {
+          "tag": "TODO"
+        },
+        "group_clause": {
+          "tag": "List"
+        },
+        "having_clause": {
+          "tag": "TODO"
+        },
+        "window_clause": {
+          "tag": "List"
+        },
+        "values_lists": {
+          "tag": "List"
+        },
+        "sort_clause": {
+          "tag": "List"
+        },
+        "limit_offset": {
+          "tag": "TODO"
+        },
+        "limit_count": {
+          "tag": "TODO"
+        },
+        "locking_clause": {
+          "tag": "List"
+        },
+        "op": 0,
+        "all": false
+      },
+      "stmt_location": 0,
+      "stmt_len": 31
+    }
+  }
+]

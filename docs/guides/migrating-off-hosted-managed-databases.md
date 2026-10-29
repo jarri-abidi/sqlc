@@ -1,6 +1,6 @@
 # Migrating off hosted managed databases
  
-Starting in sqlc 1.27.0, [managed databases](../docs/managed-databases.md) will require a database server URI in the configuration file.
+Starting in sqlc 1.27.0, [managed databases](../howto/managed-databases.md) will require a database server URI in the configuration file.
 
 This guide walks you through migrating to a locally running database server.
 
@@ -50,7 +50,7 @@ docker compose up -d
 
 ## Upgrade sqlc
 
-You must be running sqlc v1.30.0 or greater to have access to the `servers`
+You must be running sqlc v1.31.1 or greater to have access to the `servers`
 configuration.
 
 ## Add servers to configuration

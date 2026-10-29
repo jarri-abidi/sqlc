@@ -79,10 +79,7 @@
                         "type": "object",
                         "properties": {
                             "database": {
-                                "oneOf": [
-                                    {"type": "boolean"},
-                                    {"const": "only"}
-                                ]
+                                "type": "boolean"
                             }
                         }
                     },
@@ -126,6 +123,9 @@
                         "type": "boolean"
                     },
                     "emit_pointers_for_null_types": {
+                        "type": "boolean"
+                    },
+                    "emit_pointers_for_null_enum_types": {
                         "type": "boolean"
                     },
                     "emit_enum_valid_method": {
@@ -226,6 +226,18 @@
                     },
                     "output_models_file_name": {
                         "type": "string"
+                    },
+                    "output_models_path": {
+                        "type": "string"
+                    },
+                    "output_models_package": {
+                        "type": "string"
+                    },
+                    "output_models_import": {
+                        "type": "string"
+                    },
+                    "output_models_emit": {
+                        "type": "boolean"
                     },
                     "output_querier_file_name": {
                         "type": "string"

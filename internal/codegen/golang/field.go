@@ -11,12 +11,15 @@ import (
 )
 
 type Field struct {
-	Name    string // CamelCased name for Go
-	DBName  string // Name as used in the DB
-	Type    string
-	Tags    map[string]string
-	Comment string
-	Column  *plugin.Column
+	Name   string // CamelCased name for Go
+	DBName string // Name as used in the DB
+	// ParamName is the name of the placeholder a parameter is bound by,
+	// when the query names it; empty otherwise and for row fields.
+	ParamName string
+	Type      string
+	Tags      map[string]string
+	Comment   string
+	Column    *plugin.Column
 	// EmbedFields contains the embedded fields that require scanning.
 	EmbedFields []Field
 }
@@ -97,23 +100,23 @@ func toPascalCase(s string) string {
 }
 
 func toCamelInitCase(name string, initUpper bool) string {
-	out := ""
+	var out strings.Builder
 	for i, p := range strings.Split(name, "_") {
 		if !initUpper && i == 0 {
-			out += p
+			out.WriteString(p)
 			continue
 		}
 		if p == "id" {
-			out += "ID"
+			out.WriteString("ID")
 		} else {
-			out += strings.Title(p)
+			out.WriteString(strings.Title(p))
 		}
 	}
-	return out
+	return out.String()
 }
 
 func toJsonCamelCase(name string, idUppercase bool) string {
-	out := ""
+	var out strings.Builder
 	idStr := "Id"
 
 	if idUppercase {
@@ -122,16 +125,16 @@ func toJsonCamelCase(name string, idUppercase bool) string {
 
 	for i, p := range strings.Split(name, "_") {
 		if i == 0 {
-			out += p
+			out.WriteString(p)
 			continue
 		}
 		if p == "id" {
-			out += idStr
+			out.WriteString(idStr)
 		} else {
-			out += strings.Title(p)
+			out.WriteString(strings.Title(p))
 		}
 	}
-	return out
+	return out.String()
 }
 
 func toLowerCase(str string) string {

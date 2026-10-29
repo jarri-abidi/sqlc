@@ -1,0 +1,123 @@
+[
+  {
+    "name": "ListUsers",
+    "cmd": ":many",
+    "columns": [
+      {
+        "name": "id",
+        "type": {
+          "name": "int64"
+        },
+        "table": "users"
+      },
+      {
+        "name": "name",
+        "type": {
+          "name": "string",
+          "args": [
+            {
+              "ident": "max"
+            }
+          ]
+        },
+        "table": "users"
+      },
+      {
+        "name": "bio",
+        "type": {
+          "name": "string",
+          "nullable": true,
+          "args": [
+            {
+              "ident": "max"
+            }
+          ]
+        },
+        "table": "users"
+      }
+    ],
+    "params": []
+  },
+  {
+    "name": "CountUsers",
+    "cmd": ":one",
+    "columns": [
+      {
+        "name": "total",
+        "type": {
+          "name": "int64"
+        }
+      }
+    ],
+    "params": []
+  },
+  {
+    "name": "ListUserPosts",
+    "cmd": ":many",
+    "columns": [
+      {
+        "name": "name",
+        "type": {
+          "name": "string",
+          "args": [
+            {
+              "ident": "max"
+            }
+          ]
+        },
+        "table": "users"
+      },
+      {
+        "name": "id",
+        "type": {
+          "name": "int64"
+        },
+        "table": "posts"
+      },
+      {
+        "name": "user_id",
+        "type": {
+          "name": "int64"
+        },
+        "table": "posts"
+      },
+      {
+        "name": "title",
+        "type": {
+          "name": "string",
+          "nullable": true,
+          "args": [
+            {
+              "int": 255
+            }
+          ]
+        },
+        "table": "posts"
+      },
+      {
+        "name": "created",
+        "type": {
+          "name": "timestamp"
+        },
+        "table": "posts"
+      }
+    ],
+    "params": [
+      {
+        "number": 1,
+        "column": {
+          "name": "name",
+          "type": {
+            "name": "string",
+            "args": [
+              {
+                "ident": "max"
+              }
+            ]
+          },
+          "table": "users"
+        }
+      }
+    ]
+  }
+]

@@ -1,35 +1,142 @@
 package sqlite
 
 import (
-	"github.com/sqlc-dev/sqlc/internal/engine/sqlite/parser"
+	"strings"
+
+	meyer "github.com/sqlc-dev/meyer/ast"
+
 	"github.com/sqlc-dev/sqlc/internal/sql/ast"
 )
 
-type tableNamer interface {
-	Table_name() parser.ITable_nameContext
-	Schema_name() parser.ISchema_nameContext
+// identifier folds a name the way SQLite resolves one: an unquoted name is
+// case-insensitive and normalizes to lower case, while a quoted name keeps
+// the spelling that appeared between the quotes.
+func identifier(n *meyer.Ident) string {
+	if n == nil {
+		return ""
+	}
+	if n.Quote == meyer.QuoteNone {
+		return strings.ToLower(n.Name)
+	}
+	return n.Name
 }
 
-func parseTableName(c tableNamer) *ast.TableName {
-	name := ast.TableName{
-		Name: identifier(c.Table_name().GetText()),
-	}
-	if c.Schema_name() != nil {
-		name.Schema = c.Schema_name().GetText()
-	}
-	return &name
+// NewIdentifier returns the folded name of id as an ast.String, the shape
+// sqlc uses for the parts of a ColumnRef or a function name.
+func NewIdentifier(id *meyer.Ident) *ast.String {
+	return &ast.String{Str: identifier(id)}
 }
 
-func hasNotNullConstraint(checks []parser.IColumn_constraintContext) bool {
-	for i := range checks {
-		constraint, ok := checks[i].(*parser.Column_constraintContext)
-		if !ok {
-			continue
+func parseTableName(n *meyer.QualifiedName) *ast.TableName {
+	if n == nil {
+		return &ast.TableName{}
+	}
+	return &ast.TableName{
+		Schema: identifier(n.Schema),
+		Name:   identifier(n.Name),
+	}
+}
+
+// parseRangeVar builds the relation reference sqlc expects for a table named
+// in a FROM, INSERT, UPDATE or DELETE clause.
+func parseRangeVar(n *meyer.QualifiedName, alias *meyer.Ident) *ast.RangeVar {
+	rv := &ast.RangeVar{}
+	if n == nil {
+		return rv
+	}
+	rv.Location = n.Pos()
+	name := identifier(n.Name)
+	rv.Relname = &name
+	if n.Schema != nil {
+		schema := identifier(n.Schema)
+		rv.Schemaname = &schema
+	}
+	if alias != nil {
+		aliasName := identifier(alias)
+		rv.Alias = &ast.Alias{Aliasname: &aliasName}
+	}
+	return rv
+}
+
+// typeName renders a type the way sqlc's type resolution expects to see it:
+// the tokens joined without separators, matching what the ANTLR parser's
+// GetText produced. "UNSIGNED BIG INT" becomes "UNSIGNEDBIGINT" and
+// "DECIMAL(10, 5)" becomes "DECIMAL(10,5)".
+func typeName(n *meyer.TypeName) string {
+	if n == nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(strings.ReplaceAll(n.Name, " ", ""))
+	if len(n.Args) > 0 {
+		sb.WriteString("(")
+		sb.WriteString(strings.Join(n.Args, ","))
+		sb.WriteString(")")
+	}
+	return sb.String()
+}
+
+// typeSpelling returns the type as the author wrote it — identifier tokens
+// space-joined, arguments as written — for the formatter to print back.
+// typeName folds the spaces out for catalog matching.
+func typeSpelling(n *meyer.TypeName) string {
+	if n == nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(n.Name)
+	if len(n.Args) > 0 {
+		sb.WriteString("(")
+		sb.WriteString(strings.Join(n.Args, ","))
+		sb.WriteString(")")
+	}
+	return sb.String()
+}
+
+// representableColumn reports whether a column definition round-trips
+// through the fields ast.ColumnDef models: a plain NOT NULL, a plain
+// PRIMARY KEY, or nothing. Anything else — a named constraint, a conflict
+// clause, ASC/DESC or AUTOINCREMENT, DEFAULT, UNIQUE, CHECK, COLLATE,
+// REFERENCES, GENERATED — is parsed away, so a statement printing such a
+// column would lose it. NOT NULL next to PRIMARY KEY is also beyond the
+// node: SQLite's PRIMARY KEY does not imply NOT NULL, and the printed form
+// carries only one of the pair.
+func representableColumn(def *meyer.ColumnDef) bool {
+	var notNull, primary bool
+	for _, con := range def.Constraints {
+		switch {
+		case con.Name != nil:
+			return false
+		case con.Kind == meyer.ColumnNotNull && con.OnConflict == meyer.ConflictDefault:
+			notNull = true
+		case con.Kind == meyer.ColumnPrimaryKey && con.OnConflict == meyer.ConflictDefault &&
+			con.Order == meyer.SortDefault && !con.AutoIncrement:
+			primary = true
+		default:
+			return false
 		}
-		if constraint.PRIMARY_() != nil && constraint.KEY_() != nil {
+	}
+	return !(notNull && primary)
+}
+
+// hasPrimaryKeyConstraint reports whether a column definition carries a
+// PRIMARY KEY constraint.
+func hasPrimaryKeyConstraint(constraints []*meyer.ColumnConstraint) bool {
+	for _, constraint := range constraints {
+		if constraint.Kind == meyer.ColumnPrimaryKey {
 			return true
 		}
-		if constraint.NOT_() != nil && constraint.NULL_() != nil {
+	}
+	return false
+}
+
+// hasNotNullConstraint reports whether a column definition guarantees a
+// value. A PRIMARY KEY implies NOT NULL for the purposes of code
+// generation, matching the behavior of the previous parser.
+func hasNotNullConstraint(constraints []*meyer.ColumnConstraint) bool {
+	for _, constraint := range constraints {
+		switch constraint.Kind {
+		case meyer.ColumnNotNull, meyer.ColumnPrimaryKey:
 			return true
 		}
 	}

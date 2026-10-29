@@ -18,8 +18,8 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/ext"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/ext"
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -33,7 +33,14 @@ import (
 	"github.com/sqlc-dev/sqlc/internal/quickdb"
 	"github.com/sqlc-dev/sqlc/internal/shfmt"
 	"github.com/sqlc-dev/sqlc/internal/sql/sqlpath"
+	"github.com/sqlc-dev/sqlc/internal/sqlcdebug"
 	"github.com/sqlc-dev/sqlc/internal/vet"
+)
+
+var (
+	debugDumpExplain = sqlcdebug.New("dumpexplain")
+	debugDumpVetEnv  = sqlcdebug.New("dumpvetenv")
+	debugDatabases   = sqlcdebug.New("databases")
 )
 
 var ErrFailedChecks = errors.New("failed checks")
@@ -133,7 +140,7 @@ func Vet(ctx context.Context, dir, filename string, opts *Options) error {
 		rule := rule{Program: &prg, Message: c.Msg}
 
 		// TODO There's probably a nicer way to do this from the ast
-		// https://pkg.go.dev/github.com/google/cel-go/common/ast#AllMatcher
+		// https://pkg.go.dev/cel.dev/cel-go/common/ast#AllMatcher
 		if strings.Contains(c.Rule, "postgresql.explain") ||
 			strings.Contains(c.Rule, "mysql.explain") {
 			rule.NeedsExplain = true
@@ -148,7 +155,7 @@ func Vet(ctx context.Context, dir, filename string, opts *Options) error {
 		Dir:           dir,
 		Env:           env,
 		Stderr:        stderr,
-		OnlyManagedDB: e.Debug.OnlyManagedDatabases,
+		OnlyManagedDB: debugDatabases.Value() == "managed",
 		Replacer:      shfmt.NewReplacer(nil),
 	}
 	errored := false
@@ -316,7 +323,7 @@ func (p *pgxConn) Explain(ctx context.Context, query string, args ...*plugin.Par
 	if err := row.Scan(&result); err != nil {
 		return nil, err
 	}
-	if debug.Debug.DumpExplain {
+	if debugDumpExplain.Value() == "1" {
 		fmt.Println(eQuery, "with args", eArgs)
 		fmt.Println(string(result[0]))
 	}
@@ -358,7 +365,7 @@ func (me *mysqlExplainer) Explain(ctx context.Context, query string, args ...*pl
 	if err := row.Scan(&result); err != nil {
 		return nil, err
 	}
-	if debug.Debug.DumpExplain {
+	if debugDumpExplain.Value() == "1" {
 		fmt.Println(eQuery, "with args", eArgs)
 		fmt.Println(string(result))
 	}
@@ -480,9 +487,7 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 	s.Queries = joined
 
 	var name string
-	parseOpts := opts.Parser{
-		Debug: debug.Debug,
-	}
+	parseOpts := opts.Parser{}
 
 	result, failed := parse(ctx, name, c.Dir, s, combo, parseOpts, c.Stderr)
 	if failed {
@@ -642,7 +647,7 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 					evalMap["mysql"] = engineOutput.MySQL
 				}
 
-				if debug.Debug.DumpVetEnv {
+				if debugDumpVetEnv.Value() == "1" {
 					fmt.Printf("vars for rule '%s' evaluating against query '%s':\n", name, query.Name)
 					debug.DumpAsJSON(evalMap)
 				}

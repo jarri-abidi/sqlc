@@ -38,7 +38,7 @@ database schema.  Learn more about uploading projects [here](push.md)
 
 ## General setup
 
-Install `sqlc` using the [suggested instructions](../overview/install).
+Install `sqlc` using the [suggested instructions](../overview/install.md).
 
 Create three steps in your pipeline for `sqlc diff`, `sqlc vet`, and `sqlc
 verify`. Run `sqlc push` after merge on your `main` branch.
@@ -64,7 +64,7 @@ jobs:
     - uses: actions/checkout@v3
     - uses: sqlc-dev/setup-sqlc@v3
       with:
-        sqlc-version: '1.30.0'
+        sqlc-version: '1.31.1'
     - run: sqlc diff
 ```
 
@@ -84,7 +84,7 @@ jobs:
     - uses: actions/checkout@v3
     - uses: sqlc-dev/setup-sqlc@v3
       with:
-        sqlc-version: '1.30.0'
+        sqlc-version: '1.31.1'
     # Start a PostgreSQL server
     - uses: sqlc-dev/action-setup-postgres@master
       with:
@@ -98,9 +98,8 @@ jobs:
 
 ### push
 
-```{note}
-Pushing a project is powered by [sqlc Cloud](https://dashboard.sqlc.dev). Sign up for [free](https://dashboard.sqlc.dev) today.
-```
+> [!NOTE]
+> Pushing a project is powered by [sqlc Cloud](https://dashboard.sqlc.dev). Sign up for [free](https://dashboard.sqlc.dev) today.
 
 The following GitHub Workflow configuration runs [sqlc push](push.md) on
 every push to `main`. Create an auth token via the
@@ -117,7 +116,7 @@ jobs:
     - uses: actions/checkout@v3
     - uses: sqlc-dev/setup-sqlc@v3
       with:
-        sqlc-version: '1.30.0'
+        sqlc-version: '1.31.1'
     - run: sqlc push
       env:
         SQLC_AUTH_TOKEN: ${{ secrets.SQLC_AUTH_TOKEN }}
@@ -125,9 +124,8 @@ jobs:
 
 ### verify
 
-```{note}
-Verify database migrations is powered by [sqlc Cloud](https://dashboard.sqlc.dev). Sign up for [free](https://dashboard.sqlc.dev) today.
-```
+> [!NOTE]
+> Verify database migrations is powered by [sqlc Cloud](https://dashboard.sqlc.dev). Sign up for [free](https://dashboard.sqlc.dev) today.
 
 ```yaml
 name: sqlc
@@ -139,7 +137,7 @@ jobs:
     - uses: actions/checkout@v3
     - uses: sqlc-dev/setup-sqlc@v3
       with:
-        sqlc-version: '1.30.0'
+        sqlc-version: '1.31.1'
     - uses: sqlc-dev/action-setup-postgres@master
       with:
         postgres-version: "16"
@@ -154,7 +152,7 @@ jobs:
     steps:
     - uses: sqlc-dev/setup-sqlc@v3
       with:
-        sqlc-version: '1.30.0'
+        sqlc-version: '1.31.1'
     - run: sqlc push
       env:
         SQLC_AUTH_TOKEN: ${{ secrets.SQLC_AUTH_TOKEN }}

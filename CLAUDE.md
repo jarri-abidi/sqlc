@@ -6,13 +6,13 @@ This document provides essential information for working with the sqlc codebase,
 
 ### Prerequisites
 
-- **Go 1.25.0+** - Required for building and testing
+- **Go 1.26.4+** - Required for building and testing
 - **Docker & Docker Compose** - Required for integration tests with databases (local development)
 - **Git** - For version control
 
 ## Database Setup with sqlc-test-setup
 
-The `sqlc-test-setup` tool (`cmd/sqlc-test-setup/`) automates installing and starting PostgreSQL and MySQL for tests. Both commands are idempotent and safe to re-run.
+The `sqlc-test-setup` tool (`cmd/sqlc-test-setup/`) automates installing and starting PostgreSQL, MySQL, ClickHouse, SQL Server and Spanner Omni for tests. Both commands are idempotent and safe to re-run, and take the databases to act on as arguments (`postgresql`, `mysql`, `clickhouse`, `mssql`, `spanner`); with none named they act on all five.
 
 ### Install databases
 
@@ -23,7 +23,10 @@ go run ./cmd/sqlc-test-setup install
 This will:
 - Configure the apt proxy (if `http_proxy` is set, e.g. in Claude Code remote environments)
 - Install PostgreSQL via apt
-- Download and install MySQL 9 from Oracle's deb bundle
+- Download and install MySQL 26.7 from Oracle's deb bundle
+- Download the ClickHouse 25.8 release into the user cache, where goldeneye caches it too
+- Install SQL Server 2025 from Microsoft's apt repository and run its setup, accepting the EULA on your behalf (Ubuntu 22.04 and 24.04 only)
+- Download the Spanner Omni standalone server release into the user cache (linux/amd64 only)
 - Resolve all dependencies automatically
 - Skip anything already installed
 
@@ -36,12 +39,20 @@ go run ./cmd/sqlc-test-setup start
 This will:
 - Start PostgreSQL and configure password auth (`postgres`/`postgres`)
 - Start MySQL via `mysqld_safe` and set root password (`mysecretpassword`)
-- Verify both connections
+- Start a ClickHouse server in the background on localhost, with the default user's password `mysecretpassword`
+- Start SQL Server through systemd, or in the background where there is no systemd, with the sa password `Mysecretpassword1!`
+- Start a Spanner Omni single server in the background, serving plaintext gRPC on port 15000
+- Verify the connections
 - Skip steps that are already done (running services, existing config)
 
 Connection URIs after start:
 - PostgreSQL: `postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable`
 - MySQL: `root:mysecretpassword@tcp(127.0.0.1:3306)/mysql`
+- ClickHouse: `clickhouse://default:mysecretpassword@127.0.0.1:9000` (`CLICKHOUSE_SERVER_URI`)
+- SQL Server: `sqlserver://sa:Mysecretpassword1!@127.0.0.1:1433?encrypt=disable` (`MSSQL_SERVER_URI`)
+- Spanner Omni: `localhost:15000` (`SPANNER_SERVER_URI`)
+
+The examples' tests for ClickHouse, SQL Server and Spanner read those variables and skip when unset. `docker-compose.yml` runs the same databases for anyone who prefers containers.
 
 ### Run tests
 
@@ -89,18 +100,23 @@ go test -v ./internal/config -run TestConfig
 go test -race ./internal/config
 ```
 
-## Test Types
+## Testing Strategy
 
-### 1. Unit Tests
+**Cover new work with end-to-end tests, not unit tests.** A change to the
+compiler, an engine, the analysis core or codegen is exercised by running sqlc
+the way a user does — a schema, a query file and a committed golden output —
+so the test says what sqlc produces rather than what an internal function
+returns. Internal APIs move around; the SQL that goes in and the output that
+comes out is the contract worth pinning down.
 
-- **Location:** Throughout the codebase as `*_test.go` files
-- **Run without:** Database or external dependencies
-- **Examples:**
-  - `/internal/config/config_test.go` - Configuration parsing
-  - `/internal/compiler/selector_test.go` - Compiler logic
-  - `/internal/metadata/metadata_test.go` - Query metadata parsing
+Adding coverage means adding a directory under `/internal/endtoend/testdata/`,
+not a `*_test.go` next to the code. Reach for a unit test only when the
+behavior genuinely cannot be reached through the CLI, and say why in the test.
 
-### 2. End-to-End Tests
+Some `*_test.go` files predate this and remain; they are not a precedent for
+new ones.
+
+### End-to-End Tests
 
 - **Location:** `/internal/endtoend/`
 - **Requirements:** `--tags=examples` flag and running databases
@@ -111,11 +127,69 @@ go test -race ./internal/config
   - `TestJsonSchema` - JSON schema validation
   - `TestExamplesVet` - Static analysis tests
 
-### 3. Example Tests
+A case is a directory holding the inputs and the expected output. `exec.json`
+names the command and its arguments — omit it and the case runs `generate`,
+comparing the generated files against the ones committed alongside; give it
+`{"command": "analyze", "args": [...]}` and the case compares the command's
+stdout against `stdout.json` (or `stdout.txt` for a command that does not
+print JSON). A case that is expected to fail commits its `stderr.txt`. Regenerate a golden by running the command in its directory and
+writing the output back over the committed file.
 
-- **Location:** `/examples/` directory
-- **Requirements:** Tagged with "examples", requires live databases
-- **Databases:** PostgreSQL, MySQL, SQLite examples
+`TestReplay` runs the whole corpus once per *context*. `base` runs each case as
+committed and `managed-db` reruns it against a live database, so a context can
+change the config a case is generated with and the experiments it is generated
+under. A case restricts itself to some of them with `"contexts": [...]` in its
+`exec.json`, and commits per-context expected errors as `stderr/<context>.txt`.
+There is only one set of committed golden files, so every context is expected
+to generate identical code.
+
+The `core` context generates every case through the analysis core
+(`SQLCEXPERIMENT=coreanalyzer`). The two paths still disagree, so it is opt-in
+and needs no database:
+
+```bash
+SQLC_TEST_CORE=1 go test ./internal/endtoend -run 'TestReplay/core'
+```
+
+Go aborts a test binary on panic, so a case that panics the core analyzer ends
+the run early. Run a subset to get past one (`-run 'TestReplay/core/^select'`).
+
+### Dialect Checks
+
+The dialect seeds under `/internal/engine/<engine>/dialect/` are generated
+from a live database by `/internal/goldeneye`, a nested module, and its tests
+verify the committed files against one byte for byte. The same module checks
+the `analyze_*` cases under `/internal/endtoend/testdata/` against what the
+database itself reports for them, so a `fixture.sql` next to a case's schema
+gives the queries rows to run against. ClickHouse, DuckDB, MySQL, SQLite,
+SQL Server and Spanner have the check today; engines whose database is not
+available skip.
+
+```bash
+cd internal/goldeneye
+go run ./cmd/goldeneye install clickhouse   # download the pinned clickhouse binary once
+go run ./cmd/goldeneye install duckdb       # download the current DuckDB 2.0 preview build once
+go run ./cmd/goldeneye install sqlite       # build the pinned sqlite3 shells once; needs a C compiler
+POSTGRESQL_SERVER_URI="postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable" \
+MYSQL_SERVER_URI="root:mysecretpassword@tcp(127.0.0.1:3306)/mysql" \
+MSSQL_SERVER_URI="sqlserver://sa:Mysecretpassword1!@127.0.0.1:1433?encrypt=disable" \
+SPANNER_SERVER_URI="localhost:15000" go test ./...
+go run ./cmd/goldeneye generate postgresql  # rewrite the files after a change
+```
+
+The checks are not part of CI. The `gen` workflow
+(`.github/workflows/gen.yml`) generates the files on demand and uploads
+them as an artifact.
+
+### Example Tests
+
+- **Location:** `/examples/` directory, a Go module of its own so the
+  drivers the examples run against are not dependencies of sqlc, and so
+  cgo stays on for the DuckDB driver
+- **Requirements:** Tagged with "examples", requires live databases; run
+  with `cd examples && go test --tags=examples ./...`
+- **Databases:** PostgreSQL, MySQL, SQLite, ClickHouse, DuckDB, Spanner and
+  SQL Server examples; each skips when its server is not named
 
 ## Database Services
 
@@ -126,7 +200,7 @@ The `docker-compose.yml` provides test databases:
   - Password: `mysecretpassword`
   - Database: `postgres`
 
-- **MySQL 9** - Port 3306
+- **MySQL 26.7** - Port 3306
   - User: `root`
   - Password: `mysecretpassword`
   - Database: `dinotest`
@@ -147,9 +221,10 @@ make start             # Start database containers
 ### GitHub Actions Workflow
 
 - **File:** `.github/workflows/ci.yml`
-- **Go Version:** 1.25.0
-- **Database Setup:** Uses `sqlc-test-setup` (not Docker) to install and start PostgreSQL and MySQL directly on the runner
-- **Test Command:** `gotestsum --junitfile junit.xml -- --tags=examples -timeout 20m ./...`
+- **Go Version:** 1.26.4
+- **Jobs:** `build` cross-compiles sqlc with cgo off; `test` runs sqlc's own tests; `examples` runs the examples module against every database; `vuln_check` runs `govulncheck`
+- **Database Setup:** `sqlc-test-setup` (not Docker) installs and starts the databases directly on the runner: PostgreSQL and MySQL for `test`, and all five for `examples`
+- **Test Command:** `gotestsum --junitfile junit.xml -- --tags=examples -timeout 20m ./...` in `test`, and `go test --tags=examples ./...` under `examples/` in `examples`
 - **Additional Checks:** `govulncheck` for vulnerability scanning
 
 ## Development Workflow
@@ -183,6 +258,17 @@ MYSQL_SERVER_URI="root:mysecretpassword@tcp(127.0.0.1:3306)/mysql?multiStatement
   - `/postgresql/` - PostgreSQL parser and converter
   - `/dolphin/` - MySQL parser (uses TiDB parser)
   - `/sqlite/` - SQLite parser
+  - `/duckdb/` - DuckDB 2.0 parser (uses darkwing, the pure Go port of
+    DuckDB's PEG parser)
+  - `<engine>/dialect/` - The engine's type system and standard library, as
+    JSONL read by `/internal/core/seed`; the generated parts come from
+    `/internal/goldeneye`
+- `/internal/goldeneye/` - Nested module that generates the dialect seeds
+  under `/internal/engine/<engine>/dialect/` from a live database, checks
+  the committed ones against it, and checks the analyze cases under
+  `/internal/endtoend/testdata/` against what the database reports, one
+  package per engine; see its README
+- `/internal/core/` - The analysis core: catalog, analyzer and dialect seeds
 - `/internal/compiler/` - Query compilation logic
 - `/internal/codegen/` - Code generation for different languages
 - `/internal/config/` - Configuration file parsing
@@ -232,9 +318,10 @@ go run ./cmd/sqlc-test-setup start
 ## Tips for Contributors
 
 1. **Run tests before committing:** `go test --tags=examples -timeout 20m ./...`
-2. **Check for race conditions:** Use `-race` flag when testing concurrent code
-3. **Use specific package tests:** Faster iteration during development
-4. **Read existing tests:** Good examples in `/internal/engine/postgresql/*_test.go`
+2. **Cover new behavior end to end:** Add a case under `/internal/endtoend/testdata/`
+3. **Check for race conditions:** Use `-race` flag when testing concurrent code
+4. **Iterate on one case:** `go test ./internal/endtoend -run 'TestReplay/base/<case>'`
+5. **Read existing cases:** `/internal/endtoend/testdata/` has one per feature
 
 ## Git Workflow
 

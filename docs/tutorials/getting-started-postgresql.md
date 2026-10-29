@@ -4,7 +4,7 @@ This tutorial assumes that the latest version of sqlc is
 [installed](../overview/install.md) and ready to use.
 
 We'll generate Go code here, but other
-[language plugins](../reference/language-support.rst) are available. You'll
+[language plugins](../reference/language-support.md) are available. You'll
 naturally need the Go toolchain if you want to build and run a program with the
 code sqlc generates, but sqlc itself has no dependencies.
 
@@ -188,7 +188,7 @@ package, but in this tutorial we've used `pgx/v5`:
 
 ```shell
 go get github.com/jackc/pgx/v5
-go build ./...
+go build .
 ```
 
 The program should compile without errors. To make that possible, sqlc generates

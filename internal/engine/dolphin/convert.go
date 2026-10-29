@@ -5,11 +5,11 @@ import (
 	"strconv"
 	"strings"
 
-	pcast "github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/mysql"
-	"github.com/pingcap/tidb/pkg/parser/opcode"
-	driver "github.com/pingcap/tidb/pkg/parser/test_driver"
-	"github.com/pingcap/tidb/pkg/parser/types"
+	pcast "github.com/sqlc-dev/marino/ast"
+	"github.com/sqlc-dev/marino/format"
+	"github.com/sqlc-dev/marino/mysql"
+	"github.com/sqlc-dev/marino/opcode"
+	"github.com/sqlc-dev/marino/types"
 
 	"github.com/sqlc-dev/sqlc/internal/debug"
 	"github.com/sqlc-dev/sqlc/internal/sql/ast"
@@ -17,6 +17,10 @@ import (
 
 type cc struct {
 	paramCount int
+	// preserveCase keeps identifiers exactly as written instead of
+	// lowercasing them for case-insensitive catalog matching; the format
+	// parser sets it (see NewFormatParser).
+	preserveCase bool
 }
 
 func todo(n pcast.Node) *ast.TODO {
@@ -26,17 +30,24 @@ func todo(n pcast.Node) *ast.TODO {
 	return &ast.TODO{}
 }
 
-func identifier(id string) string {
+// identifier normalizes an identifier for the compiler, which matches
+// case-insensitively by lowercasing everything. The format parser preserves
+// the author's case instead: reprinting `Event` as `event` renames the
+// table wherever table names are case-sensitive.
+func (c *cc) identifier(id string) string {
+	if c.preserveCase {
+		return id
+	}
 	return strings.ToLower(id)
 }
 
-func NewIdentifier(t string) *ast.String {
-	return &ast.String{Str: identifier(t)}
+func (c *cc) NewIdentifier(t string) *ast.String {
+	return &ast.String{Str: c.identifier(t)}
 }
 
 func (c *cc) convertAlterTableStmt(n *pcast.AlterTableStmt) ast.Node {
 	alt := &ast.AlterTableStmt{
-		Table: parseTableName(n.Table),
+		Table: c.parseTableName(n.Table),
 		Cmds:  &ast.List{},
 	}
 	for _, spec := range n.Specs {
@@ -100,7 +111,7 @@ func (c *cc) convertAlterTableStmt(n *pcast.AlterTableStmt) ast.Node {
 			oldName := spec.OldColumnName.String()
 			newName := spec.NewColumnName.String()
 			return &ast.RenameColumnStmt{
-				Table:   parseTableName(n.Table),
+				Table:   c.parseTableName(n.Table),
 				Col:     &ast.ColumnRef{Name: oldName},
 				NewName: &newName,
 			}
@@ -108,8 +119,8 @@ func (c *cc) convertAlterTableStmt(n *pcast.AlterTableStmt) ast.Node {
 		case pcast.AlterTableRenameTable:
 			// TODO: Returning here may be incorrect if there are multiple specs
 			return &ast.RenameTableStmt{
-				Table:   parseTableName(n.Table),
-				NewName: &parseTableName(spec.NewTable).Name,
+				Table:   c.parseTableName(n.Table),
+				NewName: &c.parseTableName(spec.NewTable).Name,
 			}
 
 		default:
@@ -123,11 +134,19 @@ func (c *cc) convertAlterTableStmt(n *pcast.AlterTableStmt) ast.Node {
 }
 
 func (c *cc) convertAssignment(n *pcast.Assignment) *ast.ResTarget {
-	name := identifier(n.Column.Name.String())
-	return &ast.ResTarget{
+	name := c.identifier(n.Column.Name.String())
+	target := &ast.ResTarget{
 		Name: &name,
 		Val:  c.convert(n.Expr),
 	}
+	// A multi-table UPDATE qualifies its SET columns (SET a.x = ..., b.x =
+	// ...); analysis matches on Name alone, but printing must keep the
+	// qualifier or both assignments collapse onto whichever table resolves.
+	if table := n.Column.Table.String(); table != "" {
+		table = c.identifier(table)
+		target.Relation = &table
+	}
+	return target
 }
 
 // TODO: These codes should be defined in the sql/lang package
@@ -202,6 +221,7 @@ func (c *cc) convertBinaryOperationExpr(n *pcast.BinaryOperationExpr) ast.Node {
 					c.convert(n.R),
 				},
 			},
+			Location: n.OriginTextPosition(),
 		}
 	} else {
 		return &ast.A_Expr{
@@ -211,19 +231,20 @@ func (c *cc) convertBinaryOperationExpr(n *pcast.BinaryOperationExpr) ast.Node {
 					&ast.String{Str: opToName(n.Op)},
 				},
 			},
-			Lexpr: c.convert(n.L),
-			Rexpr: c.convert(n.R),
+			Lexpr:    c.convert(n.L),
+			Rexpr:    c.convert(n.R),
+			Location: n.OriginTextPosition(),
 		}
 	}
 }
 
 func (c *cc) convertCreateTableStmt(n *pcast.CreateTableStmt) ast.Node {
 	create := &ast.CreateTableStmt{
-		Name:        parseTableName(n.Table),
+		Name:        c.parseTableName(n.Table),
 		IfNotExists: n.IfNotExists,
 	}
 	if n.ReferTable != nil {
-		create.ReferTable = parseTableName(n.ReferTable)
+		create.ReferTable = c.parseTableName(n.ReferTable)
 	}
 	for _, def := range n.Cols {
 		create.Cols = append(create.Cols, convertColumnDef(def))
@@ -251,7 +272,7 @@ func convertColumnDef(def *pcast.ColumnDef) *ast.ColumnDef {
 	for _, opt := range def.Options {
 		switch opt.Tp {
 		case pcast.ColumnOptionComment:
-			if value, ok := opt.Expr.(*driver.ValueExpr); ok {
+			if value, ok := opt.Expr.(*pcast.ValueExprBase); ok {
 				comment = value.GetString()
 			}
 		}
@@ -283,6 +304,39 @@ func convertColumnDef(def *pcast.ColumnDef) *ast.ColumnDef {
 		}
 	}
 
+	// DECIMAL(p,s) / NUMERIC(p,s) and FLOAT/DOUBLE with explicit precision:
+	// the parser leaves flen and decimal at -1 when the author wrote none,
+	// so their presence is the author's, and dropping them would change the
+	// column's type.
+	switch tp {
+	case mysql.TypeNewDecimal, mysql.TypeFloat, mysql.TypeDouble:
+		if flen >= 0 {
+			mods := []ast.Node{&ast.Integer{Ival: int64(flen)}}
+			if dec := def.Tp.GetDecimal(); dec > 0 {
+				mods = append(mods, &ast.Integer{Ival: int64(dec)})
+			}
+			typeName.Typmods = &ast.List{Items: mods}
+		}
+	// MySQL drops an integer's display width except the one that means
+	// something: tinyint(1) is what drivers and codegen read as a boolean,
+	// and BOOLEAN itself is spelled that way.
+	case mysql.TypeTiny:
+		if flen == 1 {
+			typeName.Typmods = &ast.List{Items: []ast.Node{&ast.Integer{Ival: 1}}}
+		}
+	// A bit column's width is part of its type, and is 1 when left out.
+	case mysql.TypeBit:
+		if flen >= 0 {
+			typeName.Typmods = &ast.List{Items: []ast.Node{&ast.Integer{Ival: int64(flen)}}}
+		}
+	// A fractional-seconds precision is part of the type; zero is the
+	// default and is not written.
+	case mysql.TypeDatetime, mysql.TypeTimestamp, mysql.TypeDuration:
+		if fsp := def.Tp.GetDecimal(); fsp > 0 {
+			typeName.Typmods = &ast.List{Items: []ast.Node{&ast.Integer{Ival: int64(fsp)}}}
+		}
+	}
+
 	columnDef := ast.ColumnDef{
 		Colname:    def.Name.String(),
 		TypeName:   typeName,
@@ -302,12 +356,12 @@ func convertColumnDef(def *pcast.ColumnDef) *ast.ColumnDef {
 func (c *cc) convertColumnNameExpr(n *pcast.ColumnNameExpr) *ast.ColumnRef {
 	var items []ast.Node
 	if schema := n.Name.Schema.String(); schema != "" {
-		items = append(items, NewIdentifier(schema))
+		items = append(items, c.NewIdentifier(schema))
 	}
 	if table := n.Name.Table.String(); table != "" {
-		items = append(items, NewIdentifier(table))
+		items = append(items, c.NewIdentifier(table))
 	}
-	items = append(items, NewIdentifier(n.Name.Name.String()))
+	items = append(items, c.NewIdentifier(n.Name.Name.String()))
 	return &ast.ColumnRef{
 		Fields: &ast.List{
 			Items: items,
@@ -319,9 +373,10 @@ func (c *cc) convertColumnNameExpr(n *pcast.ColumnNameExpr) *ast.ColumnRef {
 func (c *cc) convertColumnNames(cols []*pcast.ColumnName) *ast.List {
 	list := &ast.List{Items: []ast.Node{}}
 	for i := range cols {
-		name := identifier(cols[i].Name.String())
+		name := c.identifier(cols[i].Name.String())
 		list.Items = append(list.Items, &ast.ResTarget{
-			Name: &name,
+			Name:     &name,
+			Location: cols[i].OriginTextPosition(),
 		})
 	}
 	return list
@@ -346,9 +401,9 @@ func (c *cc) convertDeleteStmt(n *pcast.DeleteStmt) *ast.DeleteStmt {
 			// Each table in the delete list is a ColumnRef like "jt.*" or "pt.*"
 			items := []ast.Node{}
 			if table.Schema.String() != "" {
-				items = append(items, NewIdentifier(table.Schema.String()))
+				items = append(items, c.NewIdentifier(table.Schema.String()))
 			}
-			items = append(items, NewIdentifier(table.Name.String()))
+			items = append(items, c.NewIdentifier(table.Name.String()))
 			items = append(items, &ast.A_Star{})
 			targets.Items = append(targets.Items, &ast.ColumnRef{
 				Fields: &ast.List{Items: items},
@@ -382,7 +437,7 @@ func (c *cc) convertDeleteStmt(n *pcast.DeleteStmt) *ast.DeleteStmt {
 func (c *cc) convertDropTableStmt(n *pcast.DropTableStmt) ast.Node {
 	drop := &ast.DropTableStmt{IfExists: n.IfExists}
 	for _, name := range n.Tables {
-		drop.Tables = append(drop.Tables, parseTableName(name))
+		drop.Tables = append(drop.Tables, c.parseTableName(name))
 	}
 	return drop
 }
@@ -391,8 +446,8 @@ func (c *cc) convertRenameTableStmt(n *pcast.RenameTableStmt) ast.Node {
 	list := &ast.List{Items: []ast.Node{}}
 	for _, table := range n.TableToTables {
 		list.Items = append(list.Items, &ast.RenameTableStmt{
-			Table:   parseTableName(table.OldTable),
-			NewName: &parseTableName(table.NewTable).Name,
+			Table:   c.parseTableName(table.OldTable),
+			NewName: &c.parseTableName(table.NewTable).Name,
 		})
 	}
 	return list
@@ -418,14 +473,17 @@ func (c *cc) convertFieldList(n *pcast.FieldList) *ast.List {
 
 func (c *cc) convertFuncCallExpr(n *pcast.FuncCallExpr) ast.Node {
 	schema := n.Schema.String()
+	// Dispatch below compares against lowercase names; the emitted name
+	// goes through identifier so the format parser keeps the author's case.
 	name := strings.ToLower(n.FnName.String())
+	emitted := c.identifier(n.FnName.String())
 
 	// TODO: Deprecate the usage of Funcname
 	items := []ast.Node{}
 	if schema != "" {
-		items = append(items, NewIdentifier(schema))
+		items = append(items, c.NewIdentifier(schema))
 	}
-	items = append(items, NewIdentifier(name))
+	items = append(items, c.NewIdentifier(emitted))
 
 	// Handle DATE_ADD/DATE_SUB specially to construct INTERVAL expressions
 	// These functions have args: [date, interval_value, TimeUnitExpr]
@@ -444,7 +502,7 @@ func (c *cc) convertFuncCallExpr(n *pcast.FuncCallExpr) ast.Node {
 				Args: args,
 				Func: &ast.FuncName{
 					Schema: schema,
-					Name:   name,
+					Name:   emitted,
 				},
 				Funcname: &ast.List{
 					Items: items,
@@ -468,7 +526,7 @@ func (c *cc) convertFuncCallExpr(n *pcast.FuncCallExpr) ast.Node {
 			Args: args,
 			Func: &ast.FuncName{
 				Schema: schema,
-				Name:   name,
+				Name:   emitted,
 			},
 			Funcname: &ast.List{
 				Items: items,
@@ -531,7 +589,7 @@ func (c *cc) convertLists(lists [][]pcast.ExprNode) *ast.List {
 	return list
 }
 
-func (c *cc) convertParamMarkerExpr(n *driver.ParamMarkerExpr) *ast.ParamRef {
+func (c *cc) convertParamMarkerExpr(n *pcast.ParamMarkerExprBase) *ast.ParamRef {
 	// Parameter numbers start at one
 	c.paramCount += 1
 	return &ast.ParamRef{
@@ -549,7 +607,7 @@ func (c *cc) convertSelectField(n *pcast.SelectField) *ast.ResTarget {
 	}
 	var name *string
 	if n.AsName.O != "" {
-		asname := identifier(n.AsName.O)
+		asname := c.identifier(n.AsName.O)
 		name = &asname
 	}
 	return &ast.ResTarget{
@@ -561,9 +619,28 @@ func (c *cc) convertSelectField(n *pcast.SelectField) *ast.ResTarget {
 }
 
 func (c *cc) convertSelectStmt(n *pcast.SelectStmt) *ast.SelectStmt {
+	// The ORDER BY expressions are recorded twice: bare in WindowClause,
+	// where the compiler's strict_order_by validation expects them, and
+	// wrapped in SortBy nodes in SortClause, which carries the sort
+	// direction and is what formatting prints. Both share the same
+	// converted nodes so parameter numbering stays intact.
 	windowClause := &ast.List{Items: make([]ast.Node, 0)}
-	orderByClause := c.convertOrderByClause(n.OrderBy)
-	if orderByClause != nil {
+	var sortClause *ast.List
+	if n.OrderBy != nil {
+		sortClause = &ast.List{Items: make([]ast.Node, 0)}
+		orderByClause := &ast.List{Items: []ast.Node{}}
+		for _, item := range n.OrderBy.Items {
+			expr := c.convert(item.Expr)
+			orderByClause.Items = append(orderByClause.Items, expr)
+			dir := ast.SortByDirDefault
+			if item.Desc {
+				dir = ast.SortByDirDesc
+			}
+			sortClause.Items = append(sortClause.Items, &ast.SortBy{
+				Node:      expr,
+				SortbyDir: dir,
+			})
+		}
 		windowClause.Items = append(windowClause.Items, orderByClause)
 	}
 
@@ -576,14 +653,42 @@ func (c *cc) convertSelectStmt(n *pcast.SelectStmt) *ast.SelectStmt {
 		WhereClause:  c.convert(n.Where),
 		WithClause:   c.convertWithClause(n.With),
 		WindowClause: windowClause,
+		SortClause:   sortClause,
 		Op:           op,
 		All:          all,
 	}
+	if n.Distinct {
+		// A plain DISTINCT, pg-style: a non-empty clause whose single TODO
+		// item means "no ON (...) expressions".
+		stmt.DistinctClause = &ast.List{Items: []ast.Node{&ast.TODO{}}}
+	}
+	stmt.TableHints = restoreTableHints(n.TableHints)
 	if n.Limit != nil {
 		stmt.LimitCount = c.convert(n.Limit.Count)
 		stmt.LimitOffset = c.convert(n.Limit.Offset)
 	}
 	return stmt
+}
+
+// restoreTableHints renders a statement's optimizer hints back to the text
+// inside their /*+ ... */ comment. The compiler has no use for hints, but
+// dropping them from a query would change how the server runs it, so the
+// statement carries them through to printing as text.
+func restoreTableHints(hints []*pcast.TableOptimizerHint) string {
+	if len(hints) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	ctx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
+	for i, h := range hints {
+		if i != 0 {
+			sb.WriteString(" ")
+		}
+		if err := h.Restore(ctx); err != nil {
+			return ""
+		}
+	}
+	return sb.String()
 }
 
 func (c *cc) convertSubqueryExpr(n *pcast.SubqueryExpr) ast.Node {
@@ -610,7 +715,7 @@ func (c *cc) convertCommonTableExpression(n *pcast.CommonTableExpression) *ast.C
 
 	columns := &ast.List{}
 	for _, col := range n.ColNameList {
-		columns.Items = append(columns.Items, NewIdentifier(col.String()))
+		columns.Items = append(columns.Items, c.NewIdentifier(col.String()))
 	}
 
 	// CTE Query is wrapped in SubqueryExpr by TiDB parser.
@@ -665,6 +770,11 @@ func (c *cc) convertUpdateStmt(n *pcast.UpdateStmt) *ast.UpdateStmt {
 		FromClause:    &ast.List{},
 		ReturningList: &ast.List{},
 		WithClause:    c.convertWithClause(n.With),
+		// The table-reference tree as written. Relations above flattens a
+		// multi-table UPDATE's join to bare tables for analysis, which
+		// would print `UPDATE a JOIN b ON ...` without its ON condition —
+		// an update of the whole cross product.
+		TableRefs: rels,
 	}
 	if n.Limit != nil {
 		stmt.LimitCount = c.convert(n.Limit.Count)
@@ -672,25 +782,25 @@ func (c *cc) convertUpdateStmt(n *pcast.UpdateStmt) *ast.UpdateStmt {
 	return stmt
 }
 
-func (c *cc) convertValueExpr(n *driver.ValueExpr) *ast.A_Const {
-	switch n.TexprNode.Type.GetType() {
-	case mysql.TypeBit:
-	case mysql.TypeDate:
-	case mysql.TypeDatetime:
-	case mysql.TypeGeometry:
-	case mysql.TypeJSON:
-	case mysql.TypeNull:
-	case mysql.TypeSet:
-	case mysql.TypeShort:
-	case mysql.TypeDuration:
-	case mysql.TypeTimestamp:
-		// TODO: Create an AST type for these?
+func (c *cc) convertValueExpr(n *pcast.ValueExprBase) *ast.A_Const {
+	// The datum's kind, not the field type, says what the literal is: a
+	// NULL arrives with a string field type, a decimal's value lives in
+	// its decimal — not float — slot, and TRUE is an int64 whose field
+	// type carries the boolean flag.
+	switch n.Datum.Kind() {
+	case pcast.KindNull:
+		return &ast.A_Const{
+			Val:      &ast.Null{},
+			Location: n.OriginTextPosition(),
+		}
 
-	case mysql.TypeTiny,
-		mysql.TypeInt24,
-		mysql.TypeYear,
-		mysql.TypeLong,
-		mysql.TypeLonglong:
+	case pcast.KindInt64:
+		if mysql.HasIsBooleanFlag(n.Type.GetFlag()) {
+			return &ast.A_Const{
+				Val:      &ast.Boolean{Boolval: n.Datum.GetInt64() > 0},
+				Location: n.OriginTextPosition(),
+			}
+		}
 		return &ast.A_Const{
 			Val: &ast.Integer{
 				Ival: n.Datum.GetInt64(),
@@ -698,9 +808,15 @@ func (c *cc) convertValueExpr(n *driver.ValueExpr) *ast.A_Const {
 			Location: n.OriginTextPosition(),
 		}
 
-	case mysql.TypeDouble,
-		mysql.TypeFloat,
-		mysql.TypeNewDecimal:
+	case pcast.KindUint64:
+		return &ast.A_Const{
+			Val: &ast.Integer{
+				Ival: int64(n.Datum.GetUint64()),
+			},
+			Location: n.OriginTextPosition(),
+		}
+
+	case pcast.KindFloat32, pcast.KindFloat64:
 		return &ast.A_Const{
 			Val: &ast.Float{
 				Str: strconv.FormatFloat(n.Datum.GetFloat64(), 'f', -1, 64),
@@ -708,7 +824,15 @@ func (c *cc) convertValueExpr(n *driver.ValueExpr) *ast.A_Const {
 			Location: n.OriginTextPosition(),
 		}
 
-	case mysql.TypeBlob, mysql.TypeString, mysql.TypeVarchar, mysql.TypeVarString, mysql.TypeLongBlob, mysql.TypeMediumBlob, mysql.TypeTinyBlob, mysql.TypeEnum:
+	case pcast.KindMysqlDecimal:
+		// The decimal's own rendering keeps the written scale: 1.0 stays
+		// 1.0.
+		return &ast.A_Const{
+			Val: &ast.Float{
+				Str: n.Datum.GetMysqlDecimal().String(),
+			},
+			Location: n.OriginTextPosition(),
+		}
 	}
 	return &ast.A_Const{
 		Val: &ast.String{
@@ -721,7 +845,7 @@ func (c *cc) convertValueExpr(n *driver.ValueExpr) *ast.A_Const {
 func (c *cc) convertWildCardField(n *pcast.WildCardField) *ast.ColumnRef {
 	items := []ast.Node{}
 	if t := n.Table.String(); t != "" {
-		items = append(items, NewIdentifier(t))
+		items = append(items, c.NewIdentifier(t))
 	}
 	items = append(items, &ast.A_Star{})
 
@@ -737,14 +861,17 @@ func (c *cc) convertAdminStmt(n *pcast.AdminStmt) ast.Node {
 }
 
 func (c *cc) convertAggregateFuncExpr(n *pcast.AggregateFuncExpr) *ast.FuncCall {
+	// Comparisons below use the lowercase name; the emitted name keeps the
+	// author's case under the format parser.
 	name := strings.ToLower(n.F)
+	emitted := c.identifier(n.F)
 	fn := &ast.FuncCall{
 		Func: &ast.FuncName{
-			Name: name,
+			Name: emitted,
 		},
 		Funcname: &ast.List{
 			Items: []ast.Node{
-				NewIdentifier(name),
+				c.NewIdentifier(emitted),
 			},
 		},
 		Args:     &ast.List{},
@@ -758,14 +885,14 @@ func (c *cc) convertAggregateFuncExpr(n *pcast.AggregateFuncExpr) *ast.FuncCall 
 	var separator string
 	if name == "group_concat" && len(args) >= 2 {
 		// The last arg is always the separator
-		if value, ok := args[len(args)-1].(*driver.ValueExpr); ok {
+		if value, ok := args[len(args)-1].(*pcast.ValueExprBase); ok {
 			separator = value.GetString()
 			args = args[:len(args)-1]
 		}
 	}
 
 	for _, a := range args {
-		if value, ok := a.(*driver.ValueExpr); ok {
+		if value, ok := a.(*pcast.ValueExprBase); ok {
 			if value.GetInt64() == int64(1) {
 				fn.AggStar = true
 				continue
@@ -775,6 +902,11 @@ func (c *cc) convertAggregateFuncExpr(n *pcast.AggregateFuncExpr) *ast.FuncCall 
 	}
 	if n.Distinct {
 		fn.AggDistinct = true
+	}
+	// GROUP_CONCAT(x ORDER BY y): the ordering decides the string that
+	// comes back, so it must survive into the printed call.
+	if n.Order != nil {
+		fn.AggOrder = c.convertOrderByItems(n.Order.Items)
 	}
 
 	// Store separator for GROUP_CONCAT (only if non-default)
@@ -944,7 +1076,7 @@ func (c *cc) convertDropDatabaseStmt(n *pcast.DropDatabaseStmt) ast.Node {
 	return &ast.DropSchemaStmt{
 		MissingOk: !n.IfExists,
 		Schemas: []*ast.String{
-			NewIdentifier(n.Name.O),
+			c.NewIdentifier(n.Name.O),
 		},
 	}
 }
@@ -998,7 +1130,8 @@ func (c *cc) convertFrameClause(n *pcast.FrameClause) ast.Node {
 }
 
 func (c *cc) convertFuncCastExpr(n *pcast.FuncCastExpr) ast.Node {
-	typeName := types.TypeStr(n.Tp.GetType())
+	tp := n.Tp.GetType()
+	typeName := types.TypeToStr(tp, n.Tp.GetCharset())
 
 	// MySQL CAST AS UNSIGNED/SIGNED uses bigint internally.
 	// We need to preserve the signed/unsigned info for formatting.
@@ -1009,10 +1142,50 @@ func (c *cc) convertFuncCastExpr(n *pcast.FuncCastExpr) ast.Node {
 			typeName = "bigint signed"
 		}
 	}
+	// CAST(x AS CHAR) and CAST(x AS BINARY) are typed by the parser as the
+	// wire's var_string, which is no SQL type, or as a char or binary.
+	// MySQL types the result as a varchar or a varbinary — its metadata
+	// and a view over it both say so.
+	switch typeName {
+	case "var_string", "char":
+		typeName = "varchar"
+		if n.Tp.GetCharset() == "binary" {
+			typeName = "varbinary"
+		}
+	case "binary":
+		typeName = "varbinary"
+	}
+
+	out := &ast.TypeName{Name: typeName}
+	flen, dec := n.Tp.GetFlen(), n.Tp.GetDecimal()
+	switch tp {
+	case mysql.TypeNewDecimal:
+		// A decimal's precision and scale are part of its type, and a
+		// scale left out is 0: CAST(x AS DECIMAL(5)) is a decimal(5,0).
+		if flen >= 0 && flen != types.UnspecifiedLength {
+			mods := []ast.Node{&ast.Integer{Ival: int64(flen)}}
+			if dec >= 0 && dec != types.UnspecifiedLength {
+				mods = append(mods, &ast.Integer{Ival: int64(dec)})
+			}
+			out.Typmods = &ast.List{Items: mods}
+		}
+	case mysql.TypeFloat, mysql.TypeDouble:
+		// The parser fills in a display width for a float or double, and
+		// a precision written as FLOAT(p) only picks between the two; the
+		// result is a plain float or double.
+	case mysql.TypeVarchar, mysql.TypeVarString, mysql.TypeString:
+		if flen > 0 && flen != types.UnspecifiedLength {
+			out.Typmods = &ast.List{Items: []ast.Node{&ast.Integer{Ival: int64(flen)}}}
+		}
+	case mysql.TypeDatetime, mysql.TypeTimestamp, mysql.TypeDuration:
+		if dec > 0 && dec != types.UnspecifiedLength {
+			out.Typmods = &ast.List{Items: []ast.Node{&ast.Integer{Ival: int64(dec)}}}
+		}
+	}
 
 	return &ast.TypeCast{
 		Arg:      c.convert(n.Expr),
-		TypeName: &ast.TypeName{Name: typeName},
+		TypeName: out,
 	}
 }
 
@@ -1070,6 +1243,7 @@ func (c *cc) convertIsNullExpr(n *pcast.IsNullExpr) ast.Node {
 				c.convert(n.Expr),
 			},
 		},
+		Location: n.OriginTextPosition(),
 	}
 }
 
@@ -1243,11 +1417,20 @@ func (c *cc) convertPatternInExpr(n *pcast.PatternInExpr) ast.Node {
 }
 
 func (c *cc) convertPatternLikeExpr(n *pcast.PatternLikeOrIlikeExpr) ast.Node {
+	kind := ast.A_Expr_Kind_ILIKE
+	op := "~~*"
+	if n.IsLike {
+		kind = ast.A_Expr_Kind_LIKE
+		op = "~~"
+	}
+	if n.Not {
+		op = "!" + op
+	}
 	return &ast.A_Expr{
-		Kind: ast.A_Expr_Kind(9),
+		Kind: kind,
 		Name: &ast.List{
 			Items: []ast.Node{
-				&ast.String{Str: "~~"},
+				&ast.String{Str: op},
 			},
 		},
 		Lexpr: c.convert(n.Expr),
@@ -1431,13 +1614,38 @@ func (c *cc) convertSetOprSelectList(n *pcast.SetOprSelectList) ast.Node {
 func (c *cc) convertSetOprStmt(n *pcast.SetOprStmt) ast.Node {
 	if n.SelectList != nil {
 		sn := c.convertSetOprSelectList(n.SelectList)
-		if ss, ok := sn.(*ast.SelectStmt); ok && n.Limit != nil {
-			ss.LimitOffset = c.convert(n.Limit.Offset)
-			ss.LimitCount = c.convert(n.Limit.Count)
+		if ss, ok := sn.(*ast.SelectStmt); ok {
+			if n.Limit != nil {
+				ss.LimitOffset = c.convert(n.Limit.Offset)
+				ss.LimitCount = c.convert(n.Limit.Count)
+			}
+			// The ORDER BY that applies to the whole compound statement
+			// (SELECT ... UNION SELECT ... ORDER BY x) lives on the set
+			// operation, not on either branch.
+			if n.OrderBy != nil {
+				ss.SortClause = c.convertOrderByItems(n.OrderBy.Items)
+			}
 		}
 		return sn
 	}
 	return todo(n)
+}
+
+// convertOrderByItems converts ORDER BY items into the SortBy list a
+// SelectStmt's SortClause carries.
+func (c *cc) convertOrderByItems(items []*pcast.ByItem) *ast.List {
+	list := &ast.List{Items: make([]ast.Node, 0, len(items))}
+	for _, item := range items {
+		dir := ast.SortByDirDefault
+		if item.Desc {
+			dir = ast.SortByDirDesc
+		}
+		list.Items = append(list.Items, &ast.SortBy{
+			Node:      c.convert(item.Expr),
+			SortbyDir: dir,
+		})
+	}
+	return list
 }
 
 func (c *cc) convertSetPwdStmt(n *pcast.SetPwdStmt) ast.Node {
@@ -1490,11 +1698,12 @@ func (c *cc) convertSplitRegionStmt(n *pcast.SplitRegionStmt) ast.Node {
 }
 
 func (c *cc) convertTableName(n *pcast.TableName) *ast.RangeVar {
-	schema := identifier(n.Schema.String())
-	rel := identifier(n.Name.String())
+	schema := c.identifier(n.Schema.String())
+	rel := c.identifier(n.Name.String())
 	return &ast.RangeVar{
 		Schemaname: &schema,
 		Relname:    &rel,
+		Location:   n.OriginTextPosition(),
 	}
 }
 
@@ -1552,7 +1761,7 @@ func (c *cc) convertTrimDirectionExpr(n *pcast.TrimDirectionExpr) ast.Node {
 
 func (c *cc) convertTruncateTableStmt(n *pcast.TruncateTableStmt) *ast.TruncateStmt {
 	return &ast.TruncateStmt{
-		Relations: toList(n.Table),
+		Relations: c.toList(n.Table),
 	}
 }
 
@@ -1608,7 +1817,7 @@ func (c *cc) convertCallStmt(n *pcast.CallStmt) ast.Node {
 	var funcname ast.List
 	for _, s := range []string{n.Procedure.Schema.L, n.Procedure.FnName.L} {
 		if s != "" {
-			funcname.Items = append(funcname.Items, NewIdentifier(s))
+			funcname.Items = append(funcname.Items, c.NewIdentifier(s))
 		}
 	}
 	var args ast.List
@@ -1649,10 +1858,10 @@ func (c *cc) convertProcedureInfo(n *pcast.ProcedureInfo) ast.Node {
 func (c *cc) convert(node pcast.Node) ast.Node {
 	switch n := node.(type) {
 
-	case *driver.ParamMarkerExpr:
+	case *pcast.ParamMarkerExprBase:
 		return c.convertParamMarkerExpr(n)
 
-	case *driver.ValueExpr:
+	case *pcast.ValueExprBase:
 		return c.convertValueExpr(n)
 
 	case *pcast.AdminStmt:

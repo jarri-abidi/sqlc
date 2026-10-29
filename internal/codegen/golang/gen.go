@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"go/format"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -19,6 +20,7 @@ import (
 type tmplCtx struct {
 	Q             string
 	Package       string
+	ModelsPackage string
 	SQLDriver     opts.SQLDriver
 	Enums         []Enum
 	Structs       []Struct
@@ -119,16 +121,19 @@ func Generate(ctx context.Context, req *plugin.GenerateRequest) (*plugin.Generat
 	if err := opts.ValidateOpts(options); err != nil {
 		return nil, err
 	}
+	if err := validateSQLPackage(req.Settings.Engine, options); err != nil {
+		return nil, err
+	}
 
 	enums := buildEnums(req, options)
 	structs := buildStructs(req, options)
-	queries, err := buildQueries(req, options, structs)
+	queries, err := buildQueries(req, options, enums, structs)
 	if err != nil {
 		return nil, err
 	}
 
 	if options.OmitUnusedStructs {
-		enums, structs = filterUnusedStructs(enums, structs, queries)
+		enums, structs = filterUnusedStructs(enums, structs, queries, options.ModelsTypeQualifier())
 	}
 
 	if err := validate(options, enums, structs, queries); err != nil {
@@ -168,6 +173,7 @@ func validate(options *opts.Options, enums []Enum, structs []Struct, queries []Q
 func generate(req *plugin.GenerateRequest, options *opts.Options, enums []Enum, structs []Struct, queries []Query) (*plugin.GenerateResponse, error) {
 	i := &importer{
 		Options: options,
+		Engine:  req.Settings.Engine,
 		Queries: queries,
 		Enums:   enums,
 		Structs: structs,
@@ -189,6 +195,7 @@ func generate(req *plugin.GenerateRequest, options *opts.Options, enums []Enum, 
 		SQLDriver:                 parseDriver(options.SqlPackage),
 		Q:                         "`",
 		Package:                   options.Package,
+		ModelsPackage:             options.ModelsPackage(),
 		Enums:                     enums,
 		Structs:                   structs,
 		SqlcVersion:               req.SqlcVersion,
@@ -297,8 +304,10 @@ func generate(req *plugin.GenerateRequest, options *opts.Options, enums []Enum, 
 	if err := execute(dbFileName, "dbFile"); err != nil {
 		return nil, err
 	}
-	if err := execute(modelsFileName, "modelsFile"); err != nil {
-		return nil, err
+	if options.ModelsEmitEnabled() {
+		if err := execute(modelsFileName, "modelsFile"); err != nil {
+			return nil, err
+		}
 	}
 	if options.EmitInterface {
 		if err := execute(querierFileName, "interfaceFile"); err != nil {
@@ -354,10 +363,8 @@ func usesCopyFrom(queries []Query) bool {
 
 func usesBatch(queries []Query) bool {
 	for _, q := range queries {
-		for _, cmd := range []string{metadata.CmdBatchExec, metadata.CmdBatchMany, metadata.CmdBatchOne} {
-			if q.Cmd == cmd {
-				return true
-			}
+		if slices.Contains([]string{metadata.CmdBatchExec, metadata.CmdBatchMany, metadata.CmdBatchOne}, q.Cmd) {
+			return true
 		}
 	}
 	return false
@@ -377,25 +384,35 @@ func checkNoTimesForMySQLCopyFrom(queries []Query) error {
 	return nil
 }
 
-func filterUnusedStructs(enums []Enum, structs []Struct, queries []Query) ([]Enum, []Struct) {
+func filterUnusedStructs(enums []Enum, structs []Struct, queries []Query, qualifier string) ([]Enum, []Struct) {
 	keepTypes := make(map[string]struct{})
+
+	keep := func(t string) {
+		keepTypes[t] = struct{}{}
+		// Also store the bare type name so that lookups against
+		// bare struct/enum names match even when types have been
+		// qualified with the models package prefix (e.g. "model.User").
+		if bare := stripQualifier(t, qualifier); bare != t {
+			keepTypes[bare] = struct{}{}
+		}
+	}
 
 	for _, query := range queries {
 		if !query.Arg.isEmpty() {
-			keepTypes[query.Arg.Type()] = struct{}{}
+			keep(query.Arg.Type())
 			if query.Arg.IsStruct() {
 				for _, field := range query.Arg.Struct.Fields {
-					keepTypes[field.Type] = struct{}{}
+					keep(field.Type)
 				}
 			}
 		}
 		if query.hasRetType() {
-			keepTypes[query.Ret.Type()] = struct{}{}
+			keep(query.Ret.Type())
 			if query.Ret.IsStruct() {
 				for _, field := range query.Ret.Struct.Fields {
-					keepTypes[strings.TrimPrefix(field.Type, "[]")] = struct{}{}
+					keep(strings.TrimPrefix(field.Type, "[]"))
 					for _, embedField := range field.EmbedFields {
-						keepTypes[embedField.Type] = struct{}{}
+						keep(embedField.Type)
 					}
 				}
 			}
@@ -406,7 +423,8 @@ func filterUnusedStructs(enums []Enum, structs []Struct, queries []Query) ([]Enu
 	for _, enum := range enums {
 		_, keep := keepTypes[enum.Name]
 		_, keepNull := keepTypes["Null"+enum.Name]
-		if keep || keepNull {
+		_, keepPointer := keepTypes["*"+enum.Name]
+		if keep || keepNull || keepPointer {
 			keepEnums = append(keepEnums, enum)
 		}
 	}

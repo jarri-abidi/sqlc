@@ -1,7 +1,7 @@
 package postgresql
 
 import (
-	nodes "github.com/pganalyze/pg_query_go/v6"
+	nodes "github.com/sqlc-dev/oliphant"
 )
 
 func isArray(n *nodes.TypeName) bool {
@@ -27,16 +27,6 @@ func isNotNull(n *nodes.ColumnDef) bool {
 		}
 	}
 	return false
-}
-
-func IsNamedParamFunc(node *nodes.Node) bool {
-	fun, ok := node.Node.(*nodes.Node_FuncCall)
-	return ok && joinNodes(fun.FuncCall.Funcname, ".") == "sqlc.arg"
-}
-
-func IsNamedParamSign(node *nodes.Node) bool {
-	expr, ok := node.Node.(*nodes.Node_AExpr)
-	return ok && joinNodes(expr.AExpr.Name, ".") == "@"
 }
 
 func makeByte(s string) byte {

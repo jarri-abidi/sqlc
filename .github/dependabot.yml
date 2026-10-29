@@ -1,7 +1,14 @@
 version: 2
 updates:
+  # The examples module replaces github.com/sqlc-dev/sqlc with ../, so it has
+  # to carry the same versions as the root module. Listing the directories
+  # together lets each group update them in a single pull request.
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+      - "/"
+      - "/examples"
+      - "/internal/goldeneye"
+      - "/internal/endtoend/testdata"
     schedule:
       interval: "daily"
     groups:
@@ -17,18 +24,4 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
-  - package-ecosystem: "pip"
-    directory: "/docs"
-    schedule:
-      interval: "daily"
-    ignore:
-      # sphinx-rtd-theme does not support the latest versions of docutils and
-      # sphinx
-      - dependency-name: "docutils"
-      - dependency-name: "sphinx"
-    groups:
-      production-dependencies:
-        dependency-type: "production"
-      development-dependencies:
-        dependency-type: "development"
 

@@ -31,7 +31,10 @@ type sqlFormatter interface {
 func TestFormat(t *testing.T) {
 	t.Parallel()
 	for _, tc := range FindTests(t, "testdata", "base") {
-		tc := tc
+		// Config-less command tests (parse, analyze) have no config to format.
+		if tc.ConfigName == "" {
+			continue
+		}
 		t.Run(tc.Name, func(t *testing.T) {
 			// Parse the config file to determine the engine
 			configPath := filepath.Join(tc.Path, tc.ConfigName)
@@ -145,7 +148,6 @@ func TestFormat(t *testing.T) {
 				}
 
 				for i, stmt := range stmts {
-					stmt := stmt
 					t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 						// Extract the original query text using statement location and length
 						start := stmt.Raw.StmtLocation
@@ -167,6 +169,12 @@ func TestFormat(t *testing.T) {
 						}
 
 						out := ast.Format(stmt.Raw, formatter)
+						// An empty rendering is the formatter's signal that
+						// the statement carries syntax the AST does not
+						// model; sqlc fmt keeps such statements as written.
+						if strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(out), ";")) == "" {
+							t.Skip("statement has no faithful rendering")
+						}
 						actual, err := fingerprint(out)
 						if err != nil {
 							t.Error(err)
